@@ -81,6 +81,12 @@ CREATE TABLE IF NOT EXISTS tenants (
     cursor_end    INTEGER NOT NULL DEFAULT 0,
     max_inflight  INTEGER NOT NULL DEFAULT 8,   -- 最大在途窗口数（可动态收缩）
     filter_locked INTEGER NOT NULL DEFAULT 0,   -- 首个窗口发出即锁定
+    -- 跨节点消费归属转移：serving 正常服务 | draining 已进入排空（不发新窗口）
+    -- | exported 清单已导出封存 | handed_over 接管回执已确认，本节点永久失权 |
+    -- incoming 本节点是接收方、已导入待确认（不服务）| adopted 接管已确认、
+    -- 本节点正在服务
+    serve_phase   TEXT NOT NULL DEFAULT 'serving',
+    handoff_epoch INTEGER NOT NULL DEFAULT 0,   -- 每次导出清单只增（代次）
     created_at    TEXT NOT NULL,
     disabled_at   TEXT,
     disable_reason TEXT
@@ -122,6 +128,33 @@ CREATE TABLE IF NOT EXISTS relay_events (
 );
 CREATE INDEX IF NOT EXISTS ix_relay_events_id ON relay_events(id);
 CREATE INDEX IF NOT EXISTS ix_relay_events_tenant ON relay_events(tenant_id, id);
+
+-- 跨节点消费归属转移（handoff）。同一 transfer_id（=清单 transfer_id）重放
+-- 返回首次结果：manifest 首次导入后其状态/result_json 固定。origin 侧导出的
+-- 清单与 receiver 侧导入的清单是同一行身份；direction 区分本机角色。
+CREATE TABLE IF NOT EXISTS transfers (
+    transfer_id    TEXT PRIMARY KEY,
+    tenant_id      TEXT NOT NULL,
+    direction      TEXT NOT NULL,              -- outgoing | incoming
+    state          TEXT NOT NULL,              -- 见下
+    handoff_epoch  INTEGER NOT NULL,
+    manifest_json  TEXT NOT NULL,              -- 签名 transfer manifest（原样）
+    manifest_digest TEXT NOT NULL,
+    result_json    TEXT,                       -- 首次导入结果（幂等重放）
+    receipt_json   TEXT,                       -- receiver 确认产生的接管回执
+    node_id        TEXT,                       -- 对端实例 id（origin/receiver）
+    rejected_reason TEXT,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_transfers_tenant ON transfers(tenant_id);
+-- 每个租户至多一个未决的外发/接收转移（undrain / 终态之后才允许下一个）
+CREATE UNIQUE INDEX IF NOT EXISTS ux_transfers_open
+    ON transfers(tenant_id)
+    WHERE state IN ('preparing','draining','exported','imported');
+-- 同一租户同一代次至多导入一次（旧代次 epoch 直接拒绝；同清单幂等）
+CREATE UNIQUE INDEX IF NOT EXISTS ux_transfers_incoming_epoch
+    ON transfers(tenant_id, handoff_epoch) WHERE direction='incoming';
 """
 
 # 旧版本（afr1 单在途包）可能存在的对象；打开时幂等清理，不影响行数据。
@@ -131,6 +164,10 @@ _DROP_LEGACY = (
 _ADD_TENANT_COLUMNS = (
     ("max_inflight", "ALTER TABLE tenants ADD COLUMN max_inflight "
                      "INTEGER NOT NULL DEFAULT 8"),
+    ("serve_phase", "ALTER TABLE tenants ADD COLUMN serve_phase "
+                    "TEXT NOT NULL DEFAULT 'serving'"),
+    ("handoff_epoch", "ALTER TABLE tenants ADD COLUMN handoff_epoch "
+                      "INTEGER NOT NULL DEFAULT 0"),
 )
 _ADD_DELIVERY_COLUMNS = (
     ("lease_epoch", "ALTER TABLE deliveries ADD COLUMN lease_epoch "

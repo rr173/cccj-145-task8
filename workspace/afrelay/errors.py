@@ -94,6 +94,102 @@ class BadDelivery(RelayError):
     reject_reason = "bad_delivery"
 
 
+class TenantHandedOver(RelayError):
+    """消费归属已随接管回执永久转移：原节点不再具有服务权。"""
+
+    code = "tenant_handed_over"
+    status = 409
+    reject_reason = "tenant_handed_over"
+
+
+class TenantDraining(RelayError):
+    """租户正在跨节点转移（draining/已导出）：不再分配新窗口。
+
+    短租约在此期间自然结束；完成提交仍允许（直到清单导出封存），但不会有
+    新窗口从本节点发出。
+    """
+
+    code = "tenant_draining"
+    status = 409
+    reject_reason = "tenant_draining"
+
+
+class HandoffSealed(RelayError):
+    """转移清单导出后，转移前签发的凭据不得再推动已确认前缀。"""
+
+    code = "handoff_sealed"
+    status = 409
+    reject_reason = "handoff_sealed"
+
+
+class HandoffNotDrained(RelayError):
+    """导出清单时仍有未结束的有效短租约；等待其自然到期后再导出。"""
+
+    code = "handoff_not_drained"
+    status = 409
+
+
+class HandoffBadManifest(RelayError):
+    """转移清单格式错误、签名无效、内容被篡改或未决区间无法锚定本地日志。"""
+
+    code = "handoff_bad_manifest"
+    status = 400
+
+
+class HandoffStaleEpoch(RelayError):
+    """handoff_epoch 过时：每个租户的代次只增，旧代次清单拒绝导入。"""
+
+    code = "handoff_stale_epoch"
+    status = 409
+
+
+class HandoffLogBehind(RelayError):
+    """接收方透明日志尚未包含清单绑定的可信树头（高度落后）。"""
+
+    code = "handoff_log_behind"
+    status = 409
+
+
+class HandoffLogForked(RelayError):
+    """接收方在同一高度存档了不同根：日志分叉，拒绝接管。"""
+
+    code = "handoff_log_forked"
+    status = 409
+
+
+class HandoffTenantExists(RelayError):
+    """同名（同 id/名称）消费方仍在本节点服务；不能原样恢复。"""
+
+    code = "handoff_tenant_exists"
+    status = 409
+
+
+class HandoffConcurrent(RelayError):
+    """同一消费方有另一个进行中的导入；并发导入只允许一个胜出。"""
+
+    code = "handoff_concurrent"
+    status = 409
+
+
+class HandoffWrongIdentity(RelayError):
+    """接管回执与本节点导出的清单/租户/代次不一致（身份串用）。"""
+
+    code = "handoff_wrong_identity"
+    status = 409
+
+
+class HandoffState(RelayError):
+    """转移阶段不允许该操作（如回执产生后撤销、未导入就确认）。"""
+
+    code = "handoff_state"
+    status = 409
+
+
+class TransferNotFound(RelayError):
+    code = "transfer_not_found"
+    status = 404
+
+
 class FilterInvalid(RelayError):
     code = "filter_invalid"
     status = 400

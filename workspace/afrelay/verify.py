@@ -1,14 +1,14 @@
-"""离线投递包校验器（无需中继进程）。
+"""离线投递包 / 转移清单 / 接管回执校验器（无需中继进程）。
 
-审计租户拿到 afp1 投递包文件 + 中继的 secrets.json（或显式密钥材料）即可
-独立复核：
+审计租户拿到 afp1 投递包文件、跨节点转移的 aft1 清单或 aftr1 接管回执，加上
+中继的 secrets.json（或显式密钥材料）即可独立复核。
 
-* 包级 HMAC（relay_packet_secret，绑 delivery_id/区间/叶哈希/锚 checkpoint）；
-* delivery_id 由 (tenant, seq, 区间, 叶哈希) 确定性重算；
-* 每片叶子：内容地址（SHA256(0x00||规范信封)）、event 绑定；
-* 锚 checkpoint 的网关 transparency_secret 签名 + 每条 inclusion_path 折到
-  该已签名根；
-* 区间按原始序号连续、叶哈希稠密、包根与 checkpoint 根一致。
+* afp1 包级 HMAC、delivery_id 确定性重算、叶内容地址、锚 checkpoint 签名、
+  每条 inclusion_path 折到已签名根、区间连续与记录边界；
+* aft1 转移清单：机构 transparency 密钥的 HMAC、封存摘要、筛选条件/已确认
+  前缀/未决区间边界/完成标记/尝试次数一致性、每个未决区间锚 checkpoint 与
+  叶证明；
+* aftr1 接管回执：HMAC、与清单摘要/双方实例/代次绑定。
 
 退出码：0=有效；2=验签/折根失败；3=参数/文件错误。
 """
@@ -207,3 +207,177 @@ def _verify_checkpoint(cp: Any, key: bytes | None) -> dict:
     if size == 0 and root != EMPTY_HASH:
         errors.append("genesis root mismatch")
     return {"ok": not errors, "errors": errors}
+
+
+# --------------------------------------------------------------------------- #
+# cross-node transfer manifest (aft1) and takeover receipt (aftr1)
+# --------------------------------------------------------------------------- #
+
+MANIFEST_VERSION = "aft1"
+RECEIPT_VERSION = "aftr1"
+
+
+def _sealed_digest(body: dict) -> str:
+    material = {k: v for k, v in body.items()
+                if k not in ("sig", "manifest_digest")}
+    return hashlib.sha256(
+        dumps_canon(material).encode("utf-8")).hexdigest()
+
+
+def verify_transfer_manifest(manifest: dict, key: bytes, *,
+                             expected_tenant: str | None = None) -> dict:
+    """离线校验一份 aft1 转移清单（只用机构 transparency 密钥）。"""
+    errors: list[str] = []
+    checks: dict[str, Any] = {}
+    if not isinstance(manifest, dict):
+        return {"ok": False, "errors": ["manifest must be an object"]}
+    if manifest.get("manifest_version") != MANIFEST_VERSION:
+        errors.append("unsupported manifest_version")
+    expect_sig = hmac.new(
+        key,
+        dumps_canon({k: v for k, v in manifest.items() if k != "sig"})
+        .encode("utf-8"), hashlib.sha256).hexdigest()
+    sig = manifest.get("sig")
+    checks["manifest_signature"] = isinstance(sig, str) and \
+        hmac.compare_digest(sig or "", expect_sig)
+    if not checks["manifest_signature"]:
+        errors.append("manifest HMAC invalid (tampered or foreign trust domain)")
+    checks["sealed_digest"] = isinstance(manifest.get("manifest_digest"), str) \
+        and hmac.compare_digest(manifest.get("manifest_digest", ""),
+                                _sealed_digest(manifest))
+    if not checks["sealed_digest"]:
+        errors.append("manifest sealed digest does not reproduce")
+
+    tenant = manifest.get("tenant") or {}
+    if expected_tenant is not None and \
+            tenant.get("tenant_id") != expected_tenant:
+        errors.append(f"tenant {tenant.get('tenant_id')!r} != expected "
+                      f"{expected_tenant!r}")
+    cursor = tenant.get("cursor_end")
+    if not isinstance(cursor, int) or cursor < 0:
+        errors.append("tenant.cursor_end malformed")
+
+    anchor = manifest.get("log_anchor") or {}
+    cp = anchor.get("checkpoint")
+    cp_report = _verify_checkpoint(cp, key)
+    checks["anchor_signature"] = cp_report["ok"]
+    errors.extend("anchor: " + e for e in cp_report["errors"])
+    if cp_report["ok"]:
+        if cp.get("tree_size") != anchor.get("tree_size") or \
+                cp.get("root_hash") != anchor.get("root_hash"):
+            errors.append("anchor size/root disagree with its checkpoint")
+
+    pos = cursor if isinstance(cursor, int) else 0
+    prev_seq = None
+    pending = manifest.get("windows", [])
+    if not isinstance(pending, list):
+        errors.append("windows must be a list")
+        pending = []
+    for i, w in enumerate(pending):
+        try:
+            seq, start, end = int(w["seq"]), int(w["start_index"]), \
+                int(w["end_index"])
+        except (KeyError, TypeError, ValueError):
+            errors.append(f"window {i}: indices malformed")
+            continue
+        if start != pos:
+            errors.append(f"window {i}: boundary gap (want start {pos})")
+        if end <= start:
+            errors.append(f"window {i}: empty range")
+        if prev_seq is not None and seq != prev_seq + 1:
+            errors.append(f"window {i}: seq not dense")
+        prev_seq = seq
+        if w.get("state") not in ("leased", "completed"):
+            errors.append(f"window {i}: bad completion marker {w.get('state')!r}")
+        if not isinstance(w.get("lease_count"), int) or w["lease_count"] < 1:
+            errors.append(f"window {i}: attempt count malformed")
+        packet = w.get("packet")
+        if isinstance(packet, dict):
+            sub = _verify_embedded_packet_anchor(packet, key, i)
+            errors.extend(sub)
+        else:
+            errors.append(f"window {i}: packet missing")
+        pos = end
+
+    return {"ok": not errors, "errors": errors, "checks": checks,
+            "transfer_id": manifest.get("transfer_id"),
+            "tenant_id": tenant.get("tenant_id"),
+            "handoff_epoch": manifest.get("handoff_epoch"),
+            "confirmed_prefix": cursor,
+            "anchor_tree_size": anchor.get("tree_size"),
+            "anchor_root": anchor.get("root_hash"),
+            "pending_windows": len(pending),
+            "origin_instance": manifest.get("origin_instance")}
+
+
+def _verify_embedded_packet_anchor(packet: dict, key: bytes,
+                                    window_index: int) -> list[str]:
+    """清单内嵌窗口包的**锚定**校验（只需机构 transparency 密钥）：
+
+    包自身的 delivery HMAC 由发起方节点的 relay_packet_secret 签发，跨节点
+    离线校验时不持有该节点私有包钥，因此这里只验证跨节点信任所需的部分——
+    锚 checkpoint 的机构签名、叶内容地址、每条 inclusion_path 折到已签名根、
+    区间与封存边界一致。
+    """
+    pfx = f"window {window_index} packet: "
+    errors: list[str] = []
+    cp = packet.get("checkpoint")
+    rep = _verify_checkpoint(cp, key)
+    if not rep["ok"]:
+        errors.extend(pfx + e for e in rep["errors"])
+        return errors
+    end = packet.get("end_index")
+    if not isinstance(end, int) or end != cp.get("tree_size"):
+        errors.append(pfx + "end_index does not equal anchor tree_size")
+        return errors
+    root = bytes.fromhex(cp["root_hash"])
+    for r in packet.get("records", []):
+        try:
+            idx = int(r["leaf_index"])
+            if envelope_leaf_hash(r["envelope"]) != r["leaf_hash"]:
+                errors.append(pfx + f"leaf {idx}: content address mismatch")
+            path = [bytes.fromhex(h) for h in r.get("inclusion_path", [])]
+            if not verify_inclusion(root, bytes.fromhex(r["leaf_hash"]),
+                                    idx, end, path):
+                errors.append(pfx + f"leaf {idx}: inclusion fold failed")
+        except (KeyError, TypeError, ValueError) as exc:
+            errors.append(pfx + f"record malformed: {exc}")
+    return errors
+
+
+def verify_takeover_receipt(receipt: dict, key: bytes, *,
+                            manifest: dict | None = None) -> dict:
+    """离线校验 aftr1 接管回执；给定清单时核对其绑定关系。"""
+    errors: list[str] = []
+    checks: dict[str, Any] = {}
+    if not isinstance(receipt, dict):
+        return {"ok": False, "errors": ["receipt must be an object"]}
+    if receipt.get("receipt_version") != RECEIPT_VERSION:
+        errors.append("unsupported receipt_version")
+    expect = hmac.new(
+        key,
+        dumps_canon({k: v for k, v in receipt.items() if k != "sig"})
+        .encode("utf-8"), hashlib.sha256).hexdigest()
+    sig = receipt.get("sig")
+    checks["receipt_signature"] = isinstance(sig, str) and \
+        hmac.compare_digest(sig or "", expect)
+    if not checks["receipt_signature"]:
+        errors.append("receipt HMAC invalid")
+    if manifest is not None:
+        if receipt.get("manifest_digest") != manifest.get("manifest_digest"):
+            errors.append("receipt bound to a different manifest digest")
+        if receipt.get("origin_instance") != manifest.get("origin_instance"):
+            errors.append("receipt origin instance does not match manifest")
+        if receipt.get("handoff_epoch") != manifest.get("handoff_epoch"):
+            errors.append("receipt handoff_epoch does not match manifest")
+        anchor = manifest.get("log_anchor") or {}
+        ra = receipt.get("log_anchor") or {}
+        if ra.get("tree_size") != anchor.get("tree_size") or \
+                ra.get("root_hash") != anchor.get("root_hash"):
+            errors.append("receipt log anchor does not match manifest")
+    return {"ok": not errors, "errors": errors, "checks": checks,
+            "transfer_id": receipt.get("transfer_id"),
+            "tenant_id": receipt.get("tenant_id"),
+            "handoff_epoch": receipt.get("handoff_epoch"),
+            "origin_instance": receipt.get("origin_instance"),
+            "receiver_instance": receipt.get("receiver_instance")}

@@ -23,6 +23,14 @@
                                           强制租约到期（观察超时接管）
     POST /v1/admin/tenants/<id>/filter    消费开始前可改；开始后 409
     POST /v1/admin/tenants/<id>/deactivate
+    GET  /v1/admin/transfers              跨节点消费归属转移清单（可 ?tenant_id=）
+    GET  /v1/admin/transfers/<transfer_id>
+    POST /v1/admin/tenants/<id>/handoff/prepare   发起方进入 draining
+    POST /v1/admin/tenants/<id>/handoff/undo      撤销 draining/导出（回执前）
+    POST /v1/admin/tenants/<id>/handoff/export    封存并返回签名 transfer manifest
+    POST /v1/admin/handoff/import                 接收方导入清单（原样恢复）
+    POST /v1/admin/handoff/<transfer_id>/confirm  接收方确认接管（产生回执）
+    POST /v1/admin/handoff/finalize               原节点登记接管回执（永久失权）
     GET  /ui                              运维单页
 """
 
@@ -233,6 +241,50 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(200, self.relay.force_expire_window(
             tenant_id, delivery_id, reason=str(body.get("reason") or "")))
 
+    # ---- cross-node consumer ownership handoff ----
+
+    def ep_admin_transfers(self):
+        self._admin()
+        q = self._query()
+        self._send(200, {"transfers": self.relay.list_transfers(
+            tenant_id=q.get("tenant_id"))})
+
+    def ep_admin_transfer_get(self, transfer_id: str):
+        self._admin()
+        self._send(200, self.relay.get_transfer(transfer_id))
+
+    def ep_admin_handoff_prepare(self, tenant_id: str):
+        self._admin()
+        self._read_json()
+        self._send(200, self.relay.prepare_handoff(tenant_id))
+
+    def ep_admin_handoff_undo(self, tenant_id: str):
+        self._admin()
+        self._read_json()
+        self._send(200, self.relay.undo_handoff(tenant_id))
+
+    def ep_admin_handoff_export(self, tenant_id: str):
+        self._admin()
+        self._read_json()
+        self._send(200, self.relay.export_handoff(tenant_id))
+
+    def ep_admin_handoff_import(self):
+        self._admin()
+        body = self._read_json()
+        manifest = body.get("manifest", body)
+        self._send(200, self.relay.import_handoff(manifest))
+
+    def ep_admin_handoff_confirm(self, transfer_id: str):
+        self._admin()
+        self._read_json()
+        self._send(200, self.relay.confirm_handoff(transfer_id))
+
+    def ep_admin_handoff_finalize(self):
+        self._admin()
+        body = self._read_json()
+        receipt = body.get("receipt", body)
+        self._send(200, self.relay.finalize_handoff(receipt))
+
 
 def _build_routes() -> dict[str, dict]:
     import re
@@ -249,6 +301,8 @@ def _build_routes() -> dict[str, dict]:
         ("/v1/admin/tenants", _Handler.ep_admin_tenants_list),
         ("/v1/admin/tenants/<tenant_id>/windows",
          _Handler.ep_admin_tenant_windows),
+        ("/v1/admin/transfers", _Handler.ep_admin_transfers),
+        ("/v1/admin/transfers/<transfer_id>", _Handler.ep_admin_transfer_get),
     ]
     post = [
         ("/v1/relay/claim", _Handler.ep_claim),
@@ -263,6 +317,16 @@ def _build_routes() -> dict[str, dict]:
          _Handler.ep_admin_force_expire),
         ("/v1/admin/tenants/<tenant_id>/deactivate",
          _Handler.ep_admin_deactivate),
+        ("/v1/admin/tenants/<tenant_id>/handoff/prepare",
+         _Handler.ep_admin_handoff_prepare),
+        ("/v1/admin/tenants/<tenant_id>/handoff/undo",
+         _Handler.ep_admin_handoff_undo),
+        ("/v1/admin/tenants/<tenant_id>/handoff/export",
+         _Handler.ep_admin_handoff_export),
+        ("/v1/admin/handoff/import", _Handler.ep_admin_handoff_import),
+        ("/v1/admin/handoff/finalize", _Handler.ep_admin_handoff_finalize),
+        ("/v1/admin/handoff/<transfer_id>/confirm",
+         _Handler.ep_admin_handoff_confirm),
     ]
     return {"GET": {rx(p): h for p, h in get},
             "POST": {rx(p): h for p, h in post}}

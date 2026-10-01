@@ -15,7 +15,9 @@
   upstream.py   网关只读接口客户端（只 GET，验不过即抛 UpstreamError）
   relay.py      核心：同步推进、筛选、并行窗口租约/超时接管/完成、
                 连续提交屏障（乱序完成补洞一次推进）、拒绝语义
-  verify.py     离线投递包校验器（只需 relay 自己的 secrets.json）
+  handoff.py    跨节点消费归属转移：draining、签名 aft1 清单、导入锚点/同名/
+                代次校验、aftr1 接管回执、崩溃恢复不双主
+  verify.py     离线投递包 / 转移清单 / 接管回执校验器（只需机构 transparency 锚）
   server.py     ThreadingHTTPServer JSON API（租户侧 + 管理侧）
   webui.py      零依赖运维单页（/ui）
   cli.py        命令行

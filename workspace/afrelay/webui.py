@@ -39,6 +39,7 @@ INDEX_HTML = r"""<!doctype html>
   .ok { color:var(--ok); border-color:var(--ok); }
   .warn { color:var(--warn); border-color:var(--warn); }
   .bad { color:var(--bad); border-color:var(--bad); }
+  .accent { color:var(--accent); border-color:var(--accent); }
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line);
           vertical-align:top; }
@@ -97,6 +98,16 @@ INDEX_HTML = r"""<!doctype html>
     <h2>审计租户：连续提交屏障 / 在途窗口 / 持有者 / 空洞 / 重试</h2>
     <div id="tenantblocks" class="stack"></div>
   </section>
+  <section class="card span2">
+    <h2>跨节点消费归属转移（滚动维护 / 容量调整）</h2>
+    <div id="xfer" class="stack"><div class="muted">加载中…</div></div>
+    <div class="row" style="margin-top:10px">
+      <label class="row" style="margin:0">导入清单
+        <input id="ximport" type="file" accept=".json,application/json"></label>
+      <label class="row" style="margin:0">登记接管回执（原节点永久失权）
+        <input id="xreceipt" type="file" accept=".json,application/json"></label>
+    </div>
+  </section>
   <section class="card">
     <h2>新建租户</h2>
     <label>tenant_id</label><input id="nid" placeholder="auditor-a">
@@ -136,9 +147,15 @@ async function refresh(){
   try {
     const s = await api('/v1/admin/status');
     renderMirror(s.mirror); renderRejects(s.reject_counts);
-    renderTenants(s.tenants); renderEvents(s.events); msg('');
+    renderTenants(s.tenants); renderEvents(s.events);
+    const tx = await api('/v1/admin/transfers');
+    renderTransfers(tx.transfers); msg('');
   } catch(e){ msg(e.message||String(e), true); }
 }
+const PHASE_PILL = {
+  serving: ['正常服务','ok'], adopted: ['已接管·服务中','ok'],
+  draining: ['draining 排空中','warn'], exported: ['清单已封存','warn'],
+  incoming: ['已导入待确认','warn'], handed_over: ['已移交·永久失权','bad'] };
 function renderMirror(m){
   const stop = m.last_status==='stopped';
   const fr = m.upstream_frozen ? pill('上游已冻结 '+ (m.frozen_reason||''),'bad')
@@ -165,10 +182,23 @@ function renderRejects(rc){
 function renderTenants(ts){
   document.getElementById('tenantblocks').innerHTML = ts.map(t=>{
     const id = esc(t.tenant_id);
+    const phase = t.serve_phase||'serving';
     const acts = t.active
       ? `<button class="danger" onclick="deact('${id}')">停用</button>
          <button class="ghost" onclick="shrink('${id}')">调整在途上限</button>`
       : '';
+    const ho = phase==='serving'
+      ? `<button class="ghost" title="进入 draining：不再分配新窗口，短租约自然结束"
+           onclick="hPrepare('${id}')">准备转移</button>`
+      : '';
+    const hu = (phase==='draining'||phase==='exported')
+      ? `<button class="ghost" title="回执产生前可撤销，原节点继续服务"
+           onclick="hUndo('${id}')">撤销 draining</button>` : '';
+    const he = (phase==='draining'||phase==='exported')
+      ? `<button class="ghost" title="封存签名 transfer manifest（handoff_epoch+1）"
+           onclick="hExport('${id}')">导出清单</button>` : '';
+    const pp = PHASE_PILL[phase];
+    const phasePill = phase==='serving' ? '' : pill(pp[0], pp[1]);
     const wins = (t.windows||[]).map(w=>{
       const tip = `#${w.seq} [${w.start_index},${w.end_index}) owner=${esc(w.lease_owner)} `
         + `epoch=${w.lease_epoch} retries=${w.retries}`
@@ -192,13 +222,15 @@ function renderTenants(ts){
       <div class="head">
         <b>${id}</b> <span class="muted">${esc(t.name)}</span>
         ${t.active?pill('active','ok'):pill('已停用','bad')}
+        ${phasePill}
+        ${t.handoff_epoch?pill('epoch '+t.handoff_epoch,'warn'):''}
         ${t.filter_locked?pill('规则已锁定','warn'):''}
         ${block}
         <span class="meta">提交屏障 <b>${t.commit_barrier}</b></span>
         <span class="meta">在途 ${t.inflight}/${t.max_inflight}</span>
         <span class="meta">发放前沿 ${t.frontier} · 镜像高 ${t.mirror_tree_size}</span>
         <span class="meta">原始积压 ${t.backlog} · 匹配积压 ${t.backlog_matching}</span>
-        <span style="flex:1"></span>${acts}
+        <span style="flex:1"></span>${ho}${hu}${he}${acts}
       </div>
       <div class="winbar">${wins}${holes||
         '<span class="muted">暂无在途窗口（已越过屏障的窗口被回收出在途集合）</span>'}</div>
@@ -272,6 +304,110 @@ async function createTenant(){
 document.getElementById('auto').onchange = (e)=>{
   if(e.target.checked){ refresh(); timer=setInterval(refresh,3000); }
   else clearInterval(timer);
+};
+
+// ---- cross-node consumer ownership handoff ----
+async function hPrepare(id){
+  if(!confirm('让租户 '+id+' 进入 draining？不再分配新窗口，已有短租约自然结束。')) return;
+  try {
+    const r = await api('/v1/admin/tenants/'+encodeURIComponent(id)+
+      '/handoff/prepare', {method:'POST', body:'{}'});
+    msg('已进入 draining（epoch '+r.handoff_epoch+'）'); refresh();
+  } catch(e){ msg(e.message,true); }
+}
+async function hUndo(id){
+  if(!confirm('撤销 '+id+' 的 draining/导出？原节点继续服务（接管回执产生后不可逆）。')) return;
+  try {
+    await api('/v1/admin/tenants/'+encodeURIComponent(id)+'/handoff/undo',
+      {method:'POST', body:'{}'});
+    msg('已撤销，原节点继续服务'); refresh();
+  } catch(e){ msg(e.message,true); }
+}
+async function hExport(id){
+  try {
+    const r = await api('/v1/admin/tenants/'+encodeURIComponent(id)+
+      '/handoff/export', {method:'POST', body:'{}'});
+    if(!r.manifest){ msg('返回缺少清单',true); return; }
+    download('handoff-'+id+'-e'+r.handoff_epoch+'.json',
+      JSON.stringify(r.manifest,null,2));
+    msg('清单已封存（epoch '+r.handoff_epoch+'，未决区间 '+
+      (r.pending_windows||[]).length+'），已下载；交给接收方导入'); refresh();
+  } catch(e){ msg(e.code==='handoff_not_drained'
+    ? ('仍有有效短租约：'+(e.active_lease_count||'')+'，等待自然到期后再导出')
+    : e.message, true); }
+}
+function download(name, text){
+  const b = new Blob([text], {type:'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(b); a.download = name; a.click();
+  URL.revokeObjectURL(a.href);
+}
+function renderTransfers(xs){
+  const el = document.getElementById('xfer');
+  if(!xs || !xs.length){ el.innerHTML = '<span class="muted">尚无转移</span>'; return; }
+  el.innerHTML = xs.map(x=>{
+    const role = x.direction==='outgoing' ? pill('发起方','warn') : pill('接收方','accent');
+    const wins = (x.pending_windows||[]).map(w=>
+      `<span class="win ${w.state==='completed'?'completed':'leased'}">`
+      + `#${w.seq} [${w.start_index},${w.end_index}) ${w.state} `
+      + `<span class="own">${esc(w.lease_owner||'')}×${w.retries??(w.lease_count-1)}</span>`
+      + `</span>`).join('');
+    const confirmBtn = (x.direction==='incoming' && x.state==='imported')
+      ? `<button onclick="hConfirm('${esc(x.transfer_id)}')">确认接管（出回执/换令牌）</button>` : '';
+    return `<div class="tblock">
+      <div class="head">
+        <b>${esc(x.transfer_id.slice(0,22))}…</b> ${role}
+        ${pill('阶段 '+x.state+' / '+x.phase,'warn')}
+        ${pill('epoch '+x.handoff_epoch,'')}
+        <span class="meta">租户 ${esc(x.tenant_id)}</span>
+        <span class="meta">原节点 ${esc((x.origin_instance||'—').slice(0,18))}</span>
+        <span class="meta">接收节点 ${esc((x.receiver_instance||'—').slice(0,18))}</span>
+        <span class="meta">日志锚点 @${x.log_anchor?x.log_anchor.tree_size:'—'}</span>
+        <span class="meta mono">${x.log_anchor?esc(x.log_anchor.root_hash.slice(0,16)):''}…</span>
+        <span class="meta">已确认前缀 ${x.confirmed_prefix}</span>
+        <span style="flex:1"></span>${confirmBtn}
+      </div>
+      <div class="winbar">${wins||'<span class="muted">无未决区间（空转移）</span>'}</div>
+      ${x.rejected_reason?pill('拒绝：'+esc(x.rejected_reason),'bad'):''}
+      ${x.receipt?`<details><summary class="muted">接管回执</summary>
+        <pre class="mono">${esc(JSON.stringify(x.receipt,null,2))}</pre></details>`:''}
+    </div>`;
+  }).join('');
+}
+async function hConfirm(tid){
+  if(!confirm('确认接管 '+tid.slice(0,16)+'…？将换发新租户令牌并产生签名回执，原节点登记后永久失权。')) return;
+  try {
+    const r = await api('/v1/admin/handoff/'+encodeURIComponent(tid)+'/confirm',
+      {method:'POST', body:'{}'});
+    download('receipt-'+tid.slice(0,16)+'.json', JSON.stringify(r.receipt,null,2));
+    alert('接管已确认。新租户令牌（仅显示一次）：\n'+r.token+'\n\n回执已下载，交原节点 finalize。');
+    msg('接管确认完成，回执已下载'); refresh();
+  } catch(e){ msg(e.message,true); }
+}
+async function readFile(file){
+  return JSON.parse(await file.text());
+}
+document.getElementById('ximport').onchange = async (e)=>{
+  const f = e.target.files[0]; if(!f) return;
+  try {
+    const manifest = await readFile(f);
+    const r = await api('/v1/admin/handoff/import',
+      {method:'POST', body:JSON.stringify({manifest})});
+    msg((r.idempotent?'重复导入返回首次结果':'导入成功')+'：'+r.tenant_id+
+      ' epoch '+r.handoff_epoch+'，未决区间 '+(r.pending_windows||[]).length+
+      '；确认后才对外服务'); refresh();
+  } catch(err){ msg(err.message,true); }
+  e.target.value = '';
+};
+document.getElementById('xreceipt').onchange = async (e)=>{
+  const f = e.target.files[0]; if(!f) return;
+  try {
+    const receipt = await readFile(f);
+    const r = await api('/v1/admin/handoff/finalize',
+      {method:'POST', body:JSON.stringify({receipt})});
+    msg('已登记回执：'+r.tenant_id+' 永久移交至接收节点'); refresh();
+  } catch(err){ msg(err.message,true); }
+  e.target.value = '';
 };
 refresh();
 </script>

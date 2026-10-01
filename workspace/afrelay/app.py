@@ -77,12 +77,17 @@ def bootstrap(home: str, *, upstream_url: str, upstream_token: str,
     _write_0600(config_path, config)
 
     conn = connect(os.path.join(home, "relay.sqlite"))
+    node_id = "afrn_" + pysecrets.token_hex(12)
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)",
         ("admin_token_sha256", token_hash(admin_token)))
+    conn.execute(
+        "INSERT OR IGNORE INTO meta(key, value) VALUES('node_id', ?)",
+        (node_id,))
     conn.commit()
     conn.close()
-    return {"home": os.path.abspath(home), "admin_token": admin_token}
+    return {"home": os.path.abspath(home), "admin_token": admin_token,
+            "node_id": node_id}
 
 
 def load_relay_secrets(home: str) -> dict:
@@ -120,14 +125,19 @@ def open_relay(home: str, *, with_client: bool = True,
     relay_secrets = load_relay_secrets(home)
     conn = connect(os.path.join(home, "relay.sqlite"))
     client = None
+    tkey = resolve_transparency_key(home, config, relay_secrets)
     if with_client:
-        tkey = resolve_transparency_key(home, config, relay_secrets)
         client = GatewayClient(config["upstream_url"], config["upstream_token"],
                                tkey)
-    return Relay(
+    relay = Relay(
         conn, client, relay_secrets["relay_packet_secret"],
+        handoff_key=tkey,
         default_ttl_seconds=int(config.get("default_ttl_seconds", DEFAULT_TTL)),
         batch_size=int(config.get("batch_size", DEFAULT_BATCH)),
         default_max_inflight=int(config.get("default_max_inflight",
                                            DEFAULT_MAX_INFLIGHT)),
         clock=clock)
+    # 崩溃恢复：准备/导出/导入/确认任一步退出后，未决阶段继续不对外服务，
+    # 恢复结果只能是原节点继续或新节点接管（绝不双主）
+    relay.recover_handoffs()
+    return relay

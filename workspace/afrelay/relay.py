@@ -44,18 +44,22 @@ from .errors import (
     DeliveryNotFound,
     FilterInvalid,
     FilterLocked,
+    HandoffSealed,
     InFlightCapReached,
     InvalidBody,
     InvalidConfig,
     LeaseConflict,
     RelayError,
     StaleLease,
+    TenantDraining,
+    TenantHandedOver,
     TenantInactive,
     TenantNotFound,
     TenantAlreadyExists,
     Unauthorized,
     UpstreamError,
 )
+from .handoff import HandoffMixin, SERVING_PHASES
 from .merkle import inclusion_nodes, merkle_root
 
 VALID_EVENT_TYPES = (
@@ -133,14 +137,18 @@ def _clamp_inflight(value: Any) -> int:
     return value
 
 
-class Relay:
+class Relay(HandoffMixin):
     def __init__(self, conn: sqlite3.Connection, client, packet_secret: bytes, *,
+                 handoff_key: bytes | None = None,
                  default_ttl_seconds: int = 30, batch_size: int = 100,
                  default_max_inflight: int = 8,
                  clock: Callable[[], float] | None = None):
         self.db = conn
         self.client = client                      # GatewayClient | None
         self.packet_secret = packet_secret
+        # 跨节点转移清单/回执的签名与验签信任锚：与 transparency_secret 同一
+        # 机构密钥（它本来就带外分发到每个中继实例）
+        self.handoff_key = handoff_key or packet_secret
         self.default_ttl = max(1, int(default_ttl_seconds))
         self.batch_size = max(1, int(batch_size))
         self.default_max_inflight = _clamp_inflight(default_max_inflight)
@@ -765,12 +773,21 @@ class Relay:
             tid = tenant["tenant_id"]
             trusted = self._state_row()["trusted_tree_size"]
 
+            # 跨节点转移阶段：sealed/handed-over 凭据在双方都不能再取得窗口；
+            # draining 只允许调用方回放其仍持有的有效短租约（自然结束），不再
+            # 接管/发放任何新窗口
+            phase = tenant["serve_phase"]
+            if phase not in SERVING_PHASES and phase != "draining":
+                self._gate_claim_phase(tenant)
+            allow_replay_only = phase == "draining"
+
             self.db.execute("BEGIN IMMEDIATE")
             try:
                 rows = self._inflight_rows(tid)
 
                 # 1) 调用方仍持有**有效**租约：重新领取只回放原窗口标识与
-                #    逐字节相同的原始字节（幂等，不消耗第二个槽位）
+                #    逐字节相同的原始字节（幂等，不消耗第二个槽位）。draining
+                #    阶段这是唯一被允许的路径——已有短租约自然结束。
                 mine = next((r for r in rows if r["state"] == "leased"
                              and r["lease_owner"] == consumer
                              and self._now() < float(r["lease_expires_at"])),
@@ -782,6 +799,16 @@ class Relay:
                         mine, packet, redispatched=False,
                         max_inflight=int(tenant["max_inflight"]),
                         inflight=len(rows))
+
+                if allow_replay_only:
+                    # 没有属于自己的有效短租约可回放：draining 拒绝接管/新发，
+                    # 但不改变任何窗口状态或屏障
+                    self.db.execute("COMMIT")
+                    self._reject(tid, "tenant_draining")
+                    raise TenantDraining(
+                        "tenant is draining for a cross-node handoff; this "
+                        "consumer holds no live lease, and no window is "
+                        "retaken or newly issued")
 
                 # 2) 有超时窗口（含已租出未完成）：按窗口顺序接管最前面一个，
                 #    边界/字节/delivery_id 不变，只换持有者并令 epoch+1
@@ -830,15 +857,21 @@ class Relay:
             except RelayError as exc:
                 # 拒绝：回滚业务写（屏障/租约/窗口状态不变），再把拒绝原因
                 # 独立持久化
-                self.db.execute("ROLLBACK")
+                self._safe_rollback()
                 if exc.reject_reason:
                     did = exc.detail.get("delivery_id")
                     self._reject(tid, exc.reject_reason, delivery_id=did,
                                  detail=exc.detail)
                 raise
             except Exception:
-                self.db.execute("ROLLBACK")
+                self._safe_rollback()
                 raise
+
+    def _safe_rollback(self) -> None:
+        try:
+            self.db.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
 
     def _has_pending(self, tenant_id: str, trusted: int) -> bool:
         rule = json.loads(self.db.execute(
@@ -972,6 +1005,14 @@ class Relay:
                              delivery_id=delivery_id)
                 raise TenantInactive("tenant is deactivated")
             tid = tenant["tenant_id"]
+            phase = tenant["serve_phase"]
+            if phase not in SERVING_PHASES and phase != "draining":
+                # 清单已封存/已接管：转移前凭据在双方都不能再改变已确认前缀
+                self._reject(tid,
+                             "tenant_handed_over" if phase == "handed_over"
+                             else "handoff_sealed",
+                             delivery_id=delivery_id)
+                self._gate_complete_phase(tenant)
 
             self.db.execute("BEGIN IMMEDIATE")
             try:
@@ -1039,14 +1080,14 @@ class Relay:
                                                advanced_to=advanced_to)
             except RelayError as exc:
                 # 拒绝：先回滚（屏障/租约/窗口状态一律不动），再独立记录拒绝
-                self.db.execute("ROLLBACK")
+                self._safe_rollback()
                 if exc.reject_reason:
                     self._reject(tid, exc.reject_reason,
                                  delivery_id=exc.detail.get("delivery_id"),
                                  detail=exc.detail)
                 raise
             except Exception:
-                self.db.execute("ROLLBACK")
+                self._safe_rollback()
                 raise
 
     # 向后兼容的方法名
@@ -1150,6 +1191,9 @@ class Relay:
             "active": bool(row["active"]),
             "filter": rule,
             "filter_locked": bool(row["filter_locked"]),
+            "serve_phase": row["serve_phase"],
+            "handoff_epoch": int(row["handoff_epoch"]),
+            "serving": row["serve_phase"] in SERVING_PHASES,
             "cursor_end": row["cursor_end"],
             "commit_barrier": summary["commit_barrier"],
             "max_inflight": summary["max_inflight"],
@@ -1182,6 +1226,7 @@ class Relay:
     def mirror_status(self) -> dict:
         row = self._state_row()
         return {
+            "node_id": self.node_id,
             "trusted_tree_size": row["trusted_tree_size"],
             "upstream_tree_size": row["upstream_tree_size"],
             "upstream_frozen": bool(row["upstream_frozen"]),

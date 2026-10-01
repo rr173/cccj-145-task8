@@ -125,6 +125,53 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--reason", default="")
     p.add_argument("--admin-token", required=True)
 
+    # ---- cross-node consumer ownership handoff ---- #
+    p = sub.add_parser("handoff",
+                       help="cross-node consumer ownership transfer")
+    p.add_argument("home")
+    hs = p.add_subparsers(dest="sub", required=True)
+
+    hp = hs.add_parser("prepare", help="origin: enter draining (no new windows)")
+    hp.add_argument("tenant_id")
+    hp.add_argument("--reason", default="")
+    hp.add_argument("--admin-token", required=True)
+
+    hp = hs.add_parser("revoke", help="origin: undo draining before a receipt exists")
+    hp.add_argument("tenant_id")
+    hp.add_argument("--reason", default="")
+    hp.add_argument("--admin-token", required=True)
+
+    hp = hs.add_parser("export", help="origin: seal the signed transfer manifest")
+    hp.add_argument("tenant_id")
+    hp.add_argument("--admin-token", required=True)
+    hp.add_argument("--out", help="write the manifest document to this file")
+
+    hp = hs.add_parser("import", help="receiver: restore consumer state from a manifest")
+    hp.add_argument("tenant_id", nargs="?",
+                    help="optional; tenant is taken from the manifest")
+    hp.add_argument("--manifest", required=True)
+    hp.add_argument("--admin-token", required=True)
+    hp.add_argument("--out", help="write the import result (incl. one-time token)")
+
+    hp = hs.add_parser("confirm",
+                       help="receiver: confirm takeover and emit the signed receipt")
+    hp.add_argument("tenant_id")
+    hp.add_argument("--admin-token", required=True)
+    hp.add_argument("--out", help="write the takeover receipt to this file")
+
+    hp = hs.add_parser("receipt",
+                       help="origin: accept a receipt and relinquish forever")
+    hp.add_argument("tenant_id", nargs="?")
+    hp.add_argument("--receipt", required=True)
+    hp.add_argument("--admin-token", required=True)
+
+    hp = hs.add_parser("get", help="show one consumer's transfer stage/anchor")
+    hp.add_argument("tenant_id")
+    hp.add_argument("--admin-token", required=True)
+
+    hp = hs.add_parser("list", help="list all transfer records on this node")
+    hp.add_argument("--admin-token", required=True)
+
     p = sub.add_parser("claim", help="claim/replay/take-over a parallel window")
     p.add_argument("home")
     p.add_argument("--token", required=True)
@@ -162,6 +209,16 @@ def main(argv: list[str] | None = None) -> int:
     vp.add_argument("--secrets", required=True,
                     help="relay secrets.json (may also contain transparency_secret)")
     vp.add_argument("--expect-tenant")
+
+    vm = vs.add_parser("handoff", help="verify a transfer manifest offline")
+    vm.add_argument("--manifest", required=True)
+    vm.add_argument("--secrets", required=True)
+
+    vr = vs.add_parser("receipt", help="verify a takeover receipt offline")
+    vr.add_argument("--receipt", required=True)
+    vr.add_argument("--secrets", required=True)
+    vr.add_argument("--manifest",
+                    help="optional: bind the receipt to this manifest")
 
     args = parser.parse_args(argv)
 
@@ -262,6 +319,9 @@ def _dispatch(args) -> int:
             print(_j(relay.deactivate_tenant(args.tenant_id, args.reason)))
             return 0
 
+        if args.cmd == "handoff":
+            return _handoff_dispatch(relay, args)
+
         if args.cmd == "claim":
             print(_j(relay.claim(args.token, args.consumer,
                                  ttl_seconds=args.ttl)))
@@ -312,10 +372,101 @@ def _dispatch(args) -> int:
     return 0
 
 
+def _handoff_dispatch(relay, args) -> int:
+    if not relay.check_admin(args.admin_token):
+        raise RelayError("invalid admin token")
+    sub = args.sub
+    if sub == "prepare":
+        print(_j(relay.prepare_handoff(args.tenant_id, reason=args.reason)))
+        return 0
+    if sub == "revoke":
+        print(_j(relay.revoke_handoff(args.tenant_id, reason=args.reason)))
+        return 0
+    if sub == "export":
+        view = relay.export_handoff(args.tenant_id)
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(view["manifest"], indent=2,
+                                    sort_keys=True, ensure_ascii=False))
+        print(_j(view))
+        return 0
+    if sub == "import":
+        with open(args.manifest, "r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        view = relay.import_handoff(manifest)
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(view, indent=2, sort_keys=True,
+                                    ensure_ascii=False))
+        print(_j(view))
+        return 0
+    if sub == "confirm":
+        view = relay.confirm_handoff(args.tenant_id)
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(view["receipt"], indent=2,
+                                    sort_keys=True, ensure_ascii=False))
+        print(_j(view))
+        return 0
+    if sub == "receipt":
+        with open(args.receipt, "r", encoding="utf-8") as fh:
+            receipt = json.load(fh)
+        print(_j(relay.apply_receipt(receipt)))
+        return 0
+    if sub == "get":
+        print(_j(relay.get_handoff(args.tenant_id)))
+        return 0
+    if sub == "list":
+        print(_j({"handoffs": relay.list_handoffs()}))
+        return 0
+    return 3
+
+
 def _verify(args) -> int:
-    with open(args.packet, "r", encoding="utf-8") as fh:
-        packet = json.load(fh)
-    keys = load_relay_keys(args.secrets)
-    report = verify_packet(packet, keys, expected_tenant=args.expect_tenant)
-    print(_j(report))
-    return 0 if report["ok"] else 2
+    if args.sub == "packet":
+        with open(args.packet, "r", encoding="utf-8") as fh:
+            packet = json.load(fh)
+        keys = load_relay_keys(args.secrets)
+        report = verify_packet(packet, keys, expected_tenant=args.expect_tenant)
+        print(_j(report))
+        return 0 if report["ok"] else 2
+
+    from afrelay.handoff import verify_manifest, verify_receipt  # noqa: PLC0415
+    from afrelay.verify import load_transparency_key  # noqa: PLC0415
+
+    if args.sub == "handoff":
+        with open(args.manifest, "r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        tkey = load_transparency_key(args.secrets)
+        try:
+            report = verify_manifest(manifest, tkey)
+        except RelayError as exc:
+            print(_j({"ok": False, "error": exc.code, "message": exc.message,
+                      "checks": {}}))
+            return 2
+        report = {"ok": True, **report}
+        print(_j(report))
+        return 0
+
+    if args.sub == "receipt":
+        with open(args.receipt, "r", encoding="utf-8") as fh:
+            receipt = json.load(fh)
+        tkey = load_transparency_key(args.secrets)
+        try:
+            report = verify_receipt(receipt, tkey)
+        except RelayError as exc:
+            print(_j({"ok": False, "error": exc.code, "message": exc.message}))
+            return 2
+        report = {"ok": True, **report}
+        if args.manifest:
+            from afrelay.handoff import manifest_digest
+            with open(args.manifest, "r", encoding="utf-8") as fh:
+                manifest = json.load(fh)
+            report["manifest_bound"] = \
+                report["manifest_digest"] == manifest_digest(manifest)
+            if not report["manifest_bound"]:
+                print(_j(report))
+                return 2
+        print(_j(report))
+        return 0
+    return 3

@@ -233,6 +233,53 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(200, self.relay.force_expire_window(
             tenant_id, delivery_id, reason=str(body.get("reason") or "")))
 
+    # ---- cross-node consumer ownership handoff (admin on both nodes) ---- #
+
+    def ep_admin_handoff_prepare(self, tenant_id: str):
+        self._admin()
+        body = self._read_json()
+        self._send(200, self.relay.prepare_handoff(
+            tenant_id, reason=str(body.get("reason") or "")))
+
+    def ep_admin_handoff_revoke(self, tenant_id: str):
+        self._admin()
+        body = self._read_json()
+        self._send(200, self.relay.revoke_handoff(
+            tenant_id, reason=str(body.get("reason") or "")))
+
+    def ep_admin_handoff_export(self, tenant_id: str):
+        self._admin()
+        self._send(200, self.relay.export_handoff(tenant_id))
+
+    def ep_admin_handoff_import(self):
+        self._admin()
+        body = self._read_json()
+        manifest = body.get("manifest")
+        if not isinstance(manifest, dict):
+            raise InvalidBody("manifest (signed handoff document) is required")
+        self._send(200, self.relay.import_handoff(manifest))
+
+    def ep_admin_handoff_confirm(self, tenant_id: str):
+        self._admin()
+        self._send(200, self.relay.confirm_handoff(tenant_id))
+
+    def ep_admin_handoff_receipt(self):
+        """原节点凭接收方签名的 takeover receipt 永久放弃服务权。"""
+        self._admin()
+        body = self._read_json()
+        receipt = body.get("receipt")
+        if not isinstance(receipt, dict):
+            raise InvalidBody("receipt (signed takeover receipt) is required")
+        self._send(200, self.relay.apply_receipt(receipt))
+
+    def ep_admin_handoff_get(self, tenant_id: str):
+        self._admin()
+        self._send(200, self.relay.get_handoff(tenant_id))
+
+    def ep_admin_handoff_list(self):
+        self._admin()
+        self._send(200, {"handoffs": self.relay.list_handoffs()})
+
 
 def _build_routes() -> dict[str, dict]:
     import re
@@ -249,6 +296,9 @@ def _build_routes() -> dict[str, dict]:
         ("/v1/admin/tenants", _Handler.ep_admin_tenants_list),
         ("/v1/admin/tenants/<tenant_id>/windows",
          _Handler.ep_admin_tenant_windows),
+        ("/v1/admin/tenants/<tenant_id>/handoff",
+         _Handler.ep_admin_handoff_get),
+        ("/v1/admin/handoffs", _Handler.ep_admin_handoff_list),
     ]
     post = [
         ("/v1/relay/claim", _Handler.ep_claim),
@@ -263,6 +313,16 @@ def _build_routes() -> dict[str, dict]:
          _Handler.ep_admin_force_expire),
         ("/v1/admin/tenants/<tenant_id>/deactivate",
          _Handler.ep_admin_deactivate),
+        ("/v1/admin/tenants/<tenant_id>/handoff/prepare",
+         _Handler.ep_admin_handoff_prepare),
+        ("/v1/admin/tenants/<tenant_id>/handoff/revoke",
+         _Handler.ep_admin_handoff_revoke),
+        ("/v1/admin/tenants/<tenant_id>/handoff/export",
+         _Handler.ep_admin_handoff_export),
+        ("/v1/admin/tenants/<tenant_id>/handoff/confirm",
+         _Handler.ep_admin_handoff_confirm),
+        ("/v1/admin/handoffs/import", _Handler.ep_admin_handoff_import),
+        ("/v1/admin/handoffs/receipt", _Handler.ep_admin_handoff_receipt),
     ]
     return {"GET": {rx(p): h for p, h in get},
             "POST": {rx(p): h for p, h in post}}

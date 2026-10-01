@@ -120,8 +120,10 @@ def open_relay(home: str, *, with_client: bool = True,
     relay_secrets = load_relay_secrets(home)
     conn = connect(os.path.join(home, "relay.sqlite"))
     client = None
+    tkey = relay_secrets.get("transparency_key")
     if with_client:
-        tkey = resolve_transparency_key(home, config, relay_secrets)
+        if tkey is None:
+            tkey = resolve_transparency_key(home, config, relay_secrets)
         client = GatewayClient(config["upstream_url"], config["upstream_token"],
                                tkey)
     return Relay(
@@ -130,4 +132,5 @@ def open_relay(home: str, *, with_client: bool = True,
         batch_size=int(config.get("batch_size", DEFAULT_BATCH)),
         default_max_inflight=int(config.get("default_max_inflight",
                                            DEFAULT_MAX_INFLIGHT)),
+        transparency_key=tkey,
         clock=clock)

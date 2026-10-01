@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import secrets as pysecrets
 import sqlite3
+import sys
 import threading
 import time
 from typing import Any, Callable
@@ -53,8 +54,29 @@ from .errors import (
     TenantInactive,
     TenantNotFound,
     TenantAlreadyExists,
+    TenantDraining,
+    TenantRelinquished,
     Unauthorized,
     UpstreamError,
+    HandoffActiveLeases,
+    HandoffConcurrent,
+    HandoffConflict,
+    HandoffFork,
+    HandoffIdentityMismatch,
+    HandoffLogBehind,
+    HandoffNotImported,
+    HandoffReceiptInvalid,
+    HandoffSelf,
+    HandoffStaleEpoch,
+    HandoffStateConflict,
+    HandoffTampered,
+)
+from .handoff import (
+    build_manifest,
+    build_receipt,
+    manifest_digest,
+    verify_manifest,
+    verify_receipt,
 )
 from .merkle import inclusion_nodes, merkle_root
 
@@ -137,10 +159,13 @@ class Relay:
     def __init__(self, conn: sqlite3.Connection, client, packet_secret: bytes, *,
                  default_ttl_seconds: int = 30, batch_size: int = 100,
                  default_max_inflight: int = 8,
+                 transparency_key: bytes | None = None,
                  clock: Callable[[], float] | None = None):
         self.db = conn
         self.client = client                      # GatewayClient | None
         self.packet_secret = packet_secret
+        self.transparency_key = transparency_key  # 跨节点转移签名锚（可为空：
+        # 无该锚的旧 home 只能本机服务，任何转移操作都明确失败）
         self.default_ttl = max(1, int(default_ttl_seconds))
         self.batch_size = max(1, int(batch_size))
         self.default_max_inflight = _clamp_inflight(default_max_inflight)
@@ -148,6 +173,11 @@ class Relay:
         self._lock = threading.RLock()
         self._poll_thread: threading.Thread | None = None
         self._poll_stop = threading.Event()
+
+    @property
+    def instance_id(self) -> str:
+        return self.db.execute(
+            "SELECT value FROM meta WHERE key='instance_id'").fetchone()["value"]
 
     def close(self):
         self.stop_poller()
@@ -179,6 +209,101 @@ class Relay:
         cols = ", ".join(f"{k}=?" for k in fields)
         self.db.execute(
             f"UPDATE mirror_state SET {cols} WHERE id=1", tuple(fields.values()))
+
+    def _require_transparency_key(self) -> bytes:
+        """跨节点转移的唯一签名锚（机构带外分发，与网关同名字段一致）。"""
+        if self.transparency_key is None:
+            raise InvalidConfig(
+                "transparency_secret is not configured in this relay home; "
+                "cross-node handoff is unavailable")
+        return self.transparency_key
+
+    def _tenant_packet_key(self, tenant_row: sqlite3.Row) -> bytes:
+        """某消费方 afp1 包的 HMAC 密钥。
+
+        * 本地（origin）消费方：本节点的 ``relay_packet_secret``；
+        * 跨节点接管来的消费方：清单封存的 origin 密钥，使接收方重建出
+          **同一 delivery_id 与逐字节相同的包**（外部 worker 的去重/幂等
+          锚点跨节点不变）。
+        """
+        carried = tenant_row["origin_packet_key"] if "origin_packet_key" in \
+            tenant_row.keys() else None
+        if carried:
+            return bytes.fromhex(carried)
+        return self.packet_secret
+
+    # 转移阶段 -> 该节点是否对此消费方对外服务
+    #   active：原节点正常服务；draining：原节点不再发新窗口但仍收完成确认；
+    #   importing：接收方已恢复状态但**尚未确认接管**，期间不对外服务（避免
+    #              原节点撤销后双方同时服务）；confirmed：接收方接管后服务；
+    #   exported/relinquished：不服务。
+    _ACK_SERVING_STATES = {"active", "draining", "confirmed"}
+    _CLAIM_SERVING_STATES = {"active", "confirmed"}
+
+    def _gate_tenant_service(self, tenant: sqlite3.Row, *,
+                             for_claim: bool) -> None:
+        """按跨节点转移阶段决定 claim/ack 放行与否（任何写事务之前）。
+
+        * draining：不再分配新任务（claim 拒绝）；已确认前缀不动；已有
+          短租约的完成确认仍被接受，直到租约自然结束；
+        * importing：接收方恢复了状态但尚未确认接管，一切 claim/ack 拒绝；
+        * exported：导出后窗口已被接管清单封存，任何提交都不可能再改变
+          已确认前缀（旧 lease_token 在接收方也无效）；
+        * relinquished：接管回执已产生，原节点永久失去服务权。
+        """
+        state = tenant["serve_state"] if "serve_state" in tenant.keys() \
+            else "active"
+        tid = tenant["tenant_id"]
+        if state == "relinquished":
+            self._reject(tid, "tenant_relinquished")
+            raise TenantRelinquished(
+                "a takeover receipt exists for this consumer; this node has "
+                "permanently relinquished its service right")
+        if for_claim:
+            if state == "exported":
+                self._reject(tid, "stale_lease",
+                             detail={"handoff_state": state})
+                raise StaleLease(
+                    "consumer is exported on this node; a manifest is sealed "
+                    "and a receipt is pending")
+            if state in ("draining", "importing"):
+                self._reject(tid, "tenant_draining",
+                             detail={"handoff_state": state})
+                raise TenantDraining(
+                    f"consumer is in handoff state {state}; no new windows "
+                    "are issued" + (
+                        "; existing short leases finish naturally"
+                        if state == "draining" else
+                        "; confirm the takeover to start serving here"))
+            if state not in self._CLAIM_SERVING_STATES:
+                self._reject(tid, "tenant_draining")
+                raise TenantDraining(
+                    f"consumer is in handoff state {state}; not serving")
+        else:
+            if state in ("exported", "importing"):
+                self._reject(tid, "stale_lease",
+                             detail={"handoff_state": state})
+                raise StaleLease(
+                    f"consumer is in handoff state {state}; submissions cannot "
+                    "change the confirmed prefix")
+            if state not in self._ACK_SERVING_STATES:
+                self._reject(tid, "tenant_draining")
+                raise TenantDraining(
+                    f"consumer is in handoff state {state}; not serving")
+
+    def _require_active_tenant(self, tenant_id: str) -> sqlite3.Row:
+        """管理员配置类写操作只允许在 active/已接管恢复 的阶段进行。
+
+        draining/exported/importing/relinquished 期间筛选、在途上限、停用、
+        强制接管等都被冻结，避免与转移状态相互踩踏。
+        """
+        row = self._require_tenant_id(tenant_id)
+        state = row["serve_state"]
+        if state not in ("active", "confirmed"):
+            raise HandoffStateConflict(
+                f"tenant is in handoff state {state}; configuration changes "
+                "are frozen until the transfer is revoked or confirmed")
+        return row
 
     # ------------------------------------------------------------------ #
     # synchronisation: pull signed heads + leaves, verify, then mirror
@@ -469,7 +594,7 @@ class Relay:
     def set_filter(self, tenant_id: str, filter_rule: dict | None) -> dict:
         rule = validate_filter(filter_rule)
         with self._lock:
-            row = self._require_tenant_id(tenant_id)
+            row = self._require_active_tenant(tenant_id)
             if not row["active"]:
                 raise TenantInactive("tenant is deactivated")
             # 只要租户已经开始消费（发出过任何窗口，无论是否含匹配记录或
@@ -498,7 +623,7 @@ class Relay:
         """
         new_limit = _clamp_inflight(max_inflight)
         with self._lock:
-            row = self._require_tenant_id(tenant_id)
+            row = self._require_active_tenant(tenant_id)
             old_limit = int(row["max_inflight"])
             self.db.execute(
                 "UPDATE tenants SET max_inflight=? WHERE tenant_id=?",
@@ -520,7 +645,7 @@ class Relay:
 
     def deactivate_tenant(self, tenant_id: str, reason: str = "") -> dict:
         with self._lock:
-            self._require_tenant_id(tenant_id)
+            self._require_active_tenant(tenant_id)
             self.db.execute(
                 """UPDATE tenants SET active=0, disabled_at=?, disable_reason=?
                    WHERE tenant_id=?""",
@@ -556,6 +681,15 @@ class Relay:
         """
         with self._lock:
             self._require_tenant_id(tenant_id)
+            trow = self.db.execute(
+                "SELECT serve_state FROM tenants WHERE tenant_id=?",
+                (tenant_id,)).fetchone()
+            state = trow["serve_state"]
+            # draining 期间允许强制短租约立即到期（加速进入可导出状态）；
+            # 清单封存/恢复中/已弃权后冻结该运维手段
+            if state not in ("active", "draining"):
+                raise HandoffStateConflict(
+                    f"tenant is in handoff state {state}; force-expire is frozen")
             row = self.db.execute(
                 "SELECT * FROM deliveries WHERE delivery_id=? AND tenant_id=?",
                 (delivery_id, tenant_id)).fetchone()
@@ -566,8 +700,8 @@ class Relay:
                 raise InvalidConfig(
                     f"window is {row['state']}, not leased; cannot expire")
             self.db.execute(
-                "UPDATE deliveries SET lease_expires_at=? WHERE delivery_id=?",
-                (str(self._now() - 1.0), delivery_id))
+                "UPDATE deliveries SET lease_expires_at='0' WHERE delivery_id=?",
+                (delivery_id,))
             self._event("window_force_expired", tenant_id=tenant_id,
                         delivery_id=delivery_id, reason=reason,
                         detail={"lease_owner": row["lease_owner"],
@@ -575,7 +709,7 @@ class Relay:
                                 "start": row["start_index"],
                                 "end": row["end_index"]})
             return {"delivery_id": delivery_id, "tenant_id": tenant_id,
-                    "lease_expires_at": _iso_at(self._now() - 1.0),
+                    "lease_expires_at": _iso_at(0.0),
                     "state": "leased", "retakeable": True}
 
     # ------------------------------------------------------------------ #
@@ -591,17 +725,19 @@ class Relay:
     # window leases (parallel, non-overlapping, deterministic, replayable)
     # ------------------------------------------------------------------ #
 
-    def _packet_delivery_id(self, tenant_id: str, seq: int, start: int,
-                            end: int, leaf_hashes: list[str]) -> str:
+    def _packet_delivery_id(self, packet_key: bytes, tenant_id: str, seq: int,
+                            start: int, end: int,
+                            leaf_hashes: list[str]) -> str:
         material = dumps_canon({
             "tenant_id": tenant_id, "seq": seq, "start_index": start,
             "end_index": end, "leaf_hashes": leaf_hashes,
         })
-        return "afd_" + hmac_hex(self.packet_secret, material.encode("utf-8"))[:32]
+        return "afd_" + hmac_hex(packet_key, material.encode("utf-8"))[:32]
 
     def _build_packet(self, tenant_row: sqlite3.Row, seq: int, start: int,
                       matched: list[sqlite3.Row]) -> dict:
         """从已镜像叶子确定性地构造 afp1 投递包（无租约易变字段）。"""
+        packet_key = self._tenant_packet_key(tenant_row)
         end = matched[-1]["leaf_index"] + 1
         leaf_rows = self.db.execute(
             "SELECT leaf_index, leaf_hash FROM mirror_leaves "
@@ -630,7 +766,7 @@ class Relay:
             })
         leaf_hashes = [lr["leaf_hash"] for lr in matched]
         delivery_id = self._packet_delivery_id(
-            tenant_row["tenant_id"], seq, start, end, leaf_hashes)
+            packet_key, tenant_row["tenant_id"], seq, start, end, leaf_hashes)
         rule = json.loads(tenant_row["filter_json"])
         body = {
             "packet_version": PACKAGE_FORMAT,
@@ -645,7 +781,7 @@ class Relay:
             "records": records,
             "checkpoint": checkpoint,
         }
-        body["sig"] = hmac_hex(self.packet_secret,
+        body["sig"] = hmac_hex(packet_key,
                                dumps_canon({k: v for k, v in body.items()
                                             if k != "sig"}).encode("utf-8"))
         return body
@@ -763,6 +899,7 @@ class Relay:
                 self._reject(tenant["tenant_id"], "tenant_inactive")
                 raise TenantInactive("tenant is deactivated")
             tid = tenant["tenant_id"]
+            self._gate_tenant_service(tenant, for_claim=True)
             trusted = self._state_row()["trusted_tree_size"]
 
             self.db.execute("BEGIN IMMEDIATE")
@@ -972,6 +1109,7 @@ class Relay:
                              delivery_id=delivery_id)
                 raise TenantInactive("tenant is deactivated")
             tid = tenant["tenant_id"]
+            self._gate_tenant_service(tenant, for_claim=False)
 
             self.db.execute("BEGIN IMMEDIATE")
             try:
@@ -998,6 +1136,16 @@ class Relay:
                             detail={"delivery_id": delivery_id,
                                     "ack_end": end_index,
                                     "packet_end": row["end_index"]})
+                    # 转移前签发的凭据在接管方也不能改变/重放已确认前缀：
+                    # 该窗口在本节点被接管（lease_count>1）后，必须出示本
+                    # 节点接管时发放的 lease_token
+                    if int(row["lease_count"]) > 1 and \
+                            (not lease_token or lease_token != row["lease_token"]):
+                        raise StaleLease(
+                            "this window was taken over with a newer lease "
+                            "epoch; a pre-transfer credential cannot replay it",
+                            detail={"delivery_id": delivery_id,
+                                    "lease_count": row["lease_count"]})
                     self.db.execute("COMMIT")
                     return self._complete_response(row, idempotent=True,
                                                    advanced_to=row["end_index"])
@@ -1133,6 +1281,716 @@ class Relay:
                 "committed_at": row["committed_at"]}
 
     # ------------------------------------------------------------------ #
+    # cross-node consumer ownership handoff
+    #
+    # 发起方（origin）：prepare(→draining) → export(签名清单→exported)
+    #   → revoke(回执产生前可撤销→active) 或 apply_receipt(永久→relinquished)
+    # 接收方（receiver）：import(验签/锚点/同名/代次 → imported 恢复状态)
+    #   → confirm(→confirmed，产生签名 takeover receipt)
+    #
+    # 任意一方在准备/导出/导入/确认期间退出，持久化阶段恢复后只有两种结局：
+    # 原节点继续（revoke）或新节点接管（confirm+apply_receipt）；屏障与越序
+    # 完成记录（completed 窗口）逐区间封存，不可能遗失，也不可能双方同时
+    # 对外服务（relinquished 后原节点所有 claim/ack 永久拒绝）。
+    # ------------------------------------------------------------------ #
+
+    def _handoff_row(self, role: str, tenant_id: str) -> sqlite3.Row | None:
+        return self.db.execute(
+            "SELECT * FROM handoff_records WHERE role=? AND tenant_id=? "
+            "ORDER BY handoff_epoch DESC LIMIT 1",
+            (role, tenant_id)).fetchone()
+
+    def _live_handoff(self, tenant_id: str) -> sqlite3.Row | None:
+        return self.db.execute(
+            "SELECT * FROM handoff_records WHERE tenant_id=? AND state IN "
+            "('draining','exported','relinquished','importing','confirmed') "
+            "ORDER BY id DESC LIMIT 1", (tenant_id,)).fetchone()
+
+    def prepare_handoff(self, tenant_id: str, *, reason: str = "") -> dict:
+        """发起方进入 draining：不再分配新任务，已有短租约自然结束。
+
+        handoff_epoch 只增（含撤销后再次准备）；重复准备同一在途阶段是
+        幂等的（draining 直接重放，exported 报阶段冲突——必须先撤销或
+        出示回执）。
+        """
+        with self._lock:
+            t = self._require_tenant_id(tenant_id)
+            if not t["active"]:
+                raise TenantInactive("tenant is deactivated")
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                t = self._reload_tenant(tenant_id)
+                state = t["serve_state"]
+                if state == "draining":
+                    # 幂等重放：返回已有准备结果
+                    rec = self._live_handoff(tenant_id)
+                    self.db.execute("COMMIT")
+                    return self._handoff_view(rec, t,
+                                              idempotent=True)
+                if state in ("exported", "importing", "relinquished"):
+                    raise HandoffStateConflict(
+                        f"tenant is in handoff state {state}; revoke (only "
+                        "before a receipt exists) or finish the transfer "
+                        "instead of preparing again")
+                if state in ("importing", "confirmed"):
+                    raise HandoffStateConflict(
+                        "this node is the receiver of this consumer; prepare "
+                        "belongs to the origin node")
+                epoch = int(t["handoff_epoch"]) + 1
+                now = utcnow()
+                self.db.execute(
+                    "UPDATE tenants SET serve_state='draining', "
+                    "handoff_role='origin', handoff_epoch=? WHERE tenant_id=?",
+                    (epoch, tenant_id))
+                self.db.execute(
+                    """INSERT INTO handoff_records
+                       (role, tenant_id, handoff_epoch, state, origin_instance,
+                        manifest_json, anchor_tree_size, cursor_end,
+                        created_at, updated_at)
+                       VALUES ('origin', ?, ?, 'draining', ?, NULL, NULL, ?, ?, ?)""",
+                    (tenant_id, epoch, self.instance_id, t["cursor_end"],
+                     now, now))
+                # draining 后立即让所有在途短租约到期：不抢持有者、不登记
+                # 完成、不动屏障，只使其“自然结束”（新 claim 不再发放，
+                # 完成确认在到期前仍可到达）。用绝对的 0 时刻，避免相对
+                # 当前时钟减一秒在注入时钟/长 TTL 下仍落在未来。
+                self.db.execute(
+                    "UPDATE deliveries SET lease_expires_at='0' "
+                    "WHERE tenant_id=? AND state='leased'", (tenant_id,))
+                self._event("handoff_prepared", tenant_id=tenant_id,
+                            reason=reason or None,
+                            detail={"handoff_epoch": epoch,
+                                    "origin_instance": self.instance_id,
+                                    "commit_barrier": t["cursor_end"]})
+                self.db.execute("COMMIT")
+                rec = self._live_handoff(tenant_id)
+                return self._handoff_view(rec, self._reload_tenant(tenant_id))
+            except RelayError:
+                self.db.execute("ROLLBACK")
+                raise
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+
+    def revoke_handoff(self, tenant_id: str, *, reason: str = "") -> dict:
+        """接管回执产生**之前**撤销 draining，原节点继续服务。
+
+        回执已产生（relinquished）则永久不可撤销——双方不能同时服务。
+        draining/exported（尚无回执）都允许撤销；撤销后 handoff_epoch 不
+        回退，下次 prepare 只增。
+        """
+        with self._lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                t = self._reload_tenant(tenant_id)
+                state = t["serve_state"]
+                rec = self._handoff_row("origin", tenant_id)
+                if state == "active":
+                    if rec is None or rec["state"] != "revoked":
+                        raise HandoffStateConflict(
+                            "tenant is not draining; nothing to revoke")
+                    self.db.execute("COMMIT")
+                    return self._handoff_view(rec, t, idempotent=True)
+                if state == "relinquished":
+                    raise HandoffStateConflict(
+                        "a takeover receipt already exists; the original node "
+                        "can never resume service")
+                if state not in ("draining", "exported"):
+                    raise HandoffStateConflict(
+                        f"cannot revoke handoff in state {state}")
+                now = utcnow()
+                self.db.execute(
+                    "UPDATE tenants SET serve_state='active' WHERE tenant_id=?",
+                    (tenant_id,))
+                self.db.execute(
+                    "UPDATE handoff_records SET state='revoked', updated_at=?, "
+                    "error_reason=? WHERE role='origin' AND tenant_id=?",
+                    (now, reason or None, tenant_id))
+                self._event("handoff_revoked", tenant_id=tenant_id,
+                            reason=reason or None,
+                            detail={"handoff_epoch": t["handoff_epoch"]})
+                self.db.execute("COMMIT")
+                rec = self.db.execute(
+                    "SELECT * FROM handoff_records WHERE role='origin' "
+                    "AND tenant_id=? ORDER BY handoff_epoch DESC LIMIT 1",
+                    (tenant_id,)).fetchone()
+                return self._handoff_view(rec, self._reload_tenant(tenant_id))
+            except RelayError:
+                self.db.execute("ROLLBACK")
+                raise
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+
+    def export_handoff(self, tenant_id: str) -> dict:
+        """生成签名 transfer manifest（确定性；同清单重复导出逐字节相同）。
+
+        要求处于 draining，且所有未决短租约都已自然结束（无未到期
+        leased 窗口）。已确认前缀、筛选条件、每个未决区间的边界/完成
+        标记/尝试次数与日志锚点一并封存。
+        """
+        with self._lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                t = self._reload_tenant(tenant_id)
+                state = t["serve_state"]
+                rec = self._handoff_row("origin", tenant_id)
+                if state == "exported":
+                    # 同一清单再次导出：返回首次结果（逐字节相同）
+                    self.db.execute("COMMIT")
+                    return self._handoff_view(
+                        rec, t, idempotent=True,
+                        manifest=json.loads(rec["manifest_json"]))
+                if state != "draining" or rec is None:
+                    raise HandoffStateConflict(
+                        "tenant must be draining (prepare first) before export")
+                active_lease = self.db.execute(
+                    "SELECT delivery_id FROM deliveries WHERE tenant_id=? "
+                    "AND state='leased' AND lease_expires_at > ? LIMIT 1",
+                    (tenant_id, str(self._now()))).fetchone()
+                if active_lease is not None:
+                    raise HandoffActiveLeases(
+                        "short leases are still outstanding; wait for them to "
+                        "finish naturally before exporting",
+                        detail={"delivery_id": active_lease["delivery_id"]})
+                manifest = self._seal_manifest(t, rec)
+                now = utcnow()
+                anchor = manifest["anchor"]
+                self.db.execute(
+                    "UPDATE tenants SET serve_state='exported' WHERE tenant_id=?",
+                    (tenant_id,))
+                self.db.execute(
+                    "UPDATE handoff_records SET state='exported', "
+                    "manifest_digest=?, manifest_json=?, anchor_tree_size=?, "
+                    "anchor_root_hash=?, cursor_end=?, updated_at=? WHERE id=?",
+                    (manifest_digest(manifest), dumps_canon(manifest),
+                     anchor["tree_size"], anchor["root_hash"],
+                     manifest["cursor_end"], now, rec["id"]))
+                self._event("handoff_exported", tenant_id=tenant_id,
+                            detail={"handoff_epoch": manifest["handoff_epoch"],
+                                    "manifest_digest":
+                                        manifest_digest(manifest),
+                                    "anchor_tree_size": anchor["tree_size"],
+                                    "anchor_root_hash": anchor["root_hash"],
+                                    "cursor_end": manifest["cursor_end"],
+                                    "pending": len(manifest["pending"])})
+                self.db.execute("COMMIT")
+                rec = self._handoff_row("origin", tenant_id)
+                return self._handoff_view(rec, self._reload_tenant(tenant_id),
+                                          manifest=manifest)
+            except RelayError:
+                self.db.execute("ROLLBACK")
+                raise
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+
+    def _seal_manifest(self, tenant: sqlite3.Row,
+                       rec: sqlite3.Row) -> dict:
+        tkey = self._require_transparency_key()
+        trusted = int(self._state_row()["trusted_tree_size"])
+        if trusted <= 0 and not self._has_cp(0):
+            raise HandoffStateConflict(
+                "mirror has not anchored any trusted checkpoint yet; run a "
+                "sync before exporting a handoff manifest")
+        cp_row = self.db.execute(
+            "SELECT root_hash, checkpoint_json FROM mirror_cps "
+            "WHERE tree_size=?", (trusted,)).fetchone()
+        if cp_row is None:
+            raise HandoffStateConflict(
+                f"no archived signed checkpoint at trusted head {trusted}")
+        anchor = {"tree_size": trusted, "root_hash": cp_row["root_hash"],
+                  "checkpoint": json.loads(cp_row["checkpoint_json"])}
+        # 未决区间 = 尚未越过连续提交屏障的窗口（leased 已全部到期或
+        # completed 已越序完成待补洞），按序稠密相邻
+        rows = self.db.execute(
+            "SELECT * FROM deliveries WHERE tenant_id=? AND end_index > ? "
+            "ORDER BY seq", (tenant["tenant_id"], tenant["cursor_end"])
+        ).fetchall()
+        pending = [{
+            "delivery_id": r["delivery_id"],
+            "seq": int(r["seq"]),
+            "start_index": int(r["start_index"]),
+            "end_index": int(r["end_index"]),
+            "completed": r["state"] == "completed",
+            "lease_count": int(r["lease_count"]),
+        } for r in rows]
+        return build_manifest(
+            tenant_id=tenant["tenant_id"], tenant_name=tenant["name"],
+            handoff_epoch=int(rec["handoff_epoch"]),
+            origin_instance=self.instance_id,
+            filter_rule=json.loads(tenant["filter_json"]),
+            max_inflight=int(tenant["max_inflight"]),
+            cursor_end=int(tenant["cursor_end"]), anchor=anchor,
+            pending=pending,
+            packet_key_hex=self._tenant_packet_key(tenant).hex(),
+            sealed_at=utcnow(), transparency_key=tkey)
+
+    def import_handoff(self, manifest: dict, *,
+                       new_token: str | None = None) -> dict:
+        """接收方导入签名清单并原样恢复消费状态。
+
+        证明：清单验签通过；本节点透明日志至少包含清单绑定的可信树头
+        （高度已达到且该高度的已签名根一致——落后/分叉分别拒绝）；本
+        节点不存在同名消费方（tenant_id 与 name 都不能撞）。同一清单
+        再次导入返回首次结果；旧代次/篡改/分叉/身份串用全部失败。
+        """
+        with self._lock:
+            tkey = self._require_transparency_key()
+            try:
+                parsed = verify_manifest(manifest, tkey)
+            except RelayError:
+                # 验签/结构失败（篡改、错钥）：不改任何状态，但仍落一条
+                # 可观察的拒绝事件（能拿到 tenant_id 就带上）
+                tid_pre = manifest.get("tenant_id") if isinstance(
+                    manifest, dict) else None
+                self._record_handoff_reject(
+                    tid_pre if isinstance(tid_pre, str) else None, "import")
+                raise
+            if parsed["origin_instance"] == self.instance_id:
+                self._record_handoff_reject(parsed["tenant_id"], "import")
+                raise HandoffSelf(
+                    "manifest origin instance is this same relay node")
+            tid = parsed["tenant_id"]
+            digest = parsed["digest"]
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                # 幂等：同一清单（同摘要）再次导入 → 返回首次结果；但已被
+                # 更新代次取代（superseded）的旧清单不再重放，落到下面的
+                # 代次检查并以旧代次拒绝
+                same = self.db.execute(
+                    "SELECT * FROM handoff_records WHERE role='receiver' "
+                    "AND manifest_digest=? AND state IN ('importing','confirmed')",
+                    (digest,)).fetchone()
+                if same is not None:
+                    t = self._reload_tenant(tid)
+                    self.db.execute("COMMIT")
+                    return self._handoff_view(same, t, idempotent=True,
+                                              manifest=manifest)
+                # 同消费方的既有存活记录：import 是**一次性原样恢复**，没有
+                # “替换导入”动作（与 prepare/revoke/export/import/confirm
+                # 五个动词一致）。只允许同一清单幂等重放；不同清单一律不
+                # 得改写已恢复的状态——
+                #   * 代次不更新（旧/同代次）→ handoff_stale_epoch
+                #   * 更新代次但内容不同 → handoff_conflict（相互竞争的转移
+                #     已经在此恢复，操作员必须先确认或改用新节点）
+                # 正常的代次递增链（B 确认 ep1 后作为发起方把 ep2 交给全新
+                # 的 C）总是落到没有同名消费方的节点，走下面的新建路径。
+                prior_rec = self.db.execute(
+                    "SELECT * FROM handoff_records WHERE role='receiver' "
+                    "AND tenant_id=? AND state IN ('importing','confirmed') "
+                    "ORDER BY handoff_epoch DESC LIMIT 1",
+                    (tid,)).fetchone()
+                prior_tenant = self.db.execute(
+                    "SELECT tenant_id, name FROM tenants WHERE tenant_id=? OR "
+                    "name=?", (tid, parsed["tenant_name"])).fetchone()
+                if prior_rec is not None:
+                    if int(prior_rec["handoff_epoch"]) >= parsed["handoff_epoch"]:
+                        raise HandoffStaleEpoch(
+                            f"manifest epoch {parsed['handoff_epoch']} is not "
+                            f"newer than the restored epoch "
+                            f"{prior_rec['handoff_epoch']}",
+                            detail={"manifest_epoch": parsed["handoff_epoch"],
+                                    "existing_epoch":
+                                        prior_rec["handoff_epoch"]})
+                    raise HandoffConflict(
+                        "a different manifest is already restored for this "
+                        "consumer; competing/concurrent imports cannot replace "
+                        "it (confirm it or import onto another node)",
+                        detail={"existing_epoch": prior_rec["handoff_epoch"],
+                                "manifest_epoch": parsed["handoff_epoch"]})
+                if prior_tenant is not None:
+                    # 全新 tenant_id 撞到本地既有消费方（id 或 name），或
+                    # superseded 历史之外的同名本地租户：身份串用/同名
+                    raise HandoffConflict(
+                        "a consumer with the same tenant_id/name already "
+                        "exists but is bound to a different handoff lineage",
+                        detail={"existing_tenant": prior_tenant["tenant_id"]})
+                self._require_anchor_present(parsed)
+                token_plain = new_token or (
+                    "dprt_" + pysecrets.token_urlsafe(24))
+                now = utcnow()
+                self._restore_tenant(parsed, token_plain, now)
+                rec_id = self._insert_receiver_record(parsed, manifest, now)
+                self._event(
+                    "handoff_imported", tenant_id=tid,
+                    detail={"handoff_epoch": parsed["handoff_epoch"],
+                            "manifest_digest": digest,
+                            "origin_instance": parsed["origin_instance"],
+                            "receiver_instance": self.instance_id,
+                            "anchor_tree_size": parsed["anchor"]["tree_size"],
+                            "cursor_end": parsed["cursor_end"],
+                            "pending": len(parsed["pending"])})
+                self.db.execute("COMMIT")
+                rec = self.db.execute(
+                    "SELECT * FROM handoff_records WHERE id=?",
+                    (rec_id,)).fetchone()
+                view = self._handoff_view(rec, self._reload_tenant(tid),
+                                          manifest=manifest)
+                view["token"] = token_plain  # 仅导入动作返回
+                return view
+            except RelayError:
+                self.db.execute("ROLLBACK")
+                self._record_handoff_reject(tid, "import")
+                raise
+            except sqlite3.IntegrityError as exc:
+                self.db.execute("ROLLBACK")
+                self._record_handoff_reject(tid, "import")
+                # 唯一索引 ux_handoff_live_tenant：并发导入同名消费方
+                raise HandoffConcurrent(
+                    f"concurrent import raced for consumer {tid}: {exc}")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+
+    def _record_handoff_reject(self, tenant_id: str, phase: str) -> None:
+        exc = sys.exc_info()[1]
+        if not isinstance(exc, RelayError):
+            return
+        try:
+            self.db.execute(
+                """INSERT INTO relay_events
+                   (created_at, kind, tenant_id, delivery_id, reason, detail_json)
+                   VALUES (?,?,?,?,?,?)""",
+                (utcnow(), f"handoff_{phase}_rejected", tenant_id, None,
+                 exc.code, dumps_canon(exc.detail)))
+        except sqlite3.Error:
+            pass
+
+    def _require_anchor_present(self, parsed: dict) -> None:
+        """接收方证明自己的透明日志至少包含清单绑定的可信树头。"""
+        import hashlib
+        import hmac as _hmac
+
+        anchor = parsed["anchor"]
+        size, root = anchor["tree_size"], anchor["root_hash"]
+        cp = anchor["checkpoint"]
+        # 锚 checkpoint 必须是用同一 transparency_secret 独立验签的有效树头
+        from .upstream import CHECKPOINT_VERSION  # 避免循环：仅用版本常量
+        if cp.get("checkpoint_version") != CHECKPOINT_VERSION or \
+                cp.get("tree_size") != size or cp.get("root_hash") != root:
+            raise HandoffTampered("anchor checkpoint malformed")
+        sig = cp.get("sig")
+        expect = _hmac.new(
+            self.transparency_key,
+            dumps_canon({k: v for k, v in cp.items() if k != "sig"})
+            .encode("utf-8"), hashlib.sha256).hexdigest()
+        if not isinstance(sig, str) or not _hmac.compare_digest(sig, expect):
+            raise HandoffTampered(
+                "anchor checkpoint signature invalid (forged tree head)")
+        local = self.db.execute(
+            "SELECT root_hash FROM mirror_cps WHERE tree_size=?",
+            (size,)).fetchone()
+        trusted = int(self._state_row()["trusted_tree_size"])
+        if local is None or trusted < size:
+            raise HandoffLogBehind(
+                f"local trusted tree size {trusted} has not reached the "
+                f"manifest anchor {size}; sync the transparency log first",
+                detail={"local_tree_size": trusted, "anchor_tree_size": size})
+        if local["root_hash"] != root:
+            raise HandoffFork(
+                f"local root at size {size} differs from the manifest anchor; "
+                "the transparency logs have forked",
+                detail={"tree_size": size, "local_root": local["root_hash"],
+                        "manifest_root": root})
+
+    def _restore_tenant(self, parsed: dict, token_plain: str, now: str) -> None:
+        """原样恢复消费方：身份、筛选、屏障、在途上限与每个未决区间。
+
+        恢复后阶段为 ``importing``：状态就位但接收方尚未确认接管，期间
+        不对外服务（claim/ack 一律拒绝），避免与可能撤销 draining 的原
+        节点同时对外服务。
+        """
+        tid = parsed["tenant_id"]
+        packet_hex = parsed["packet_key_hex"]
+        self.db.execute(
+            """INSERT INTO tenants
+               (tenant_id, name, token_sha256, filter_json, active,
+                cursor_end, max_inflight, filter_locked,
+                serve_state, handoff_role, handoff_epoch,
+                origin_packet_key, origin_instance, created_at)
+               VALUES (?,?,?,?,1,?,?,1,'importing','receiver',?,?,?,?)""",
+            (tid, parsed["tenant_name"], token_hash(token_plain),
+             dumps_canon(parsed["filter"]), parsed["cursor_end"],
+             parsed["max_inflight"], parsed["handoff_epoch"], packet_hex,
+             parsed["origin_instance"], now))
+        self._restore_pending(parsed, now)
+
+    def _restore_pending(self, parsed: dict, now: str) -> None:
+        tid = parsed["tenant_id"]
+        trow = self._reload_tenant(tid)
+        for w in parsed["pending"]:
+            packet = self._rebuild_pending_packet(trow, w)
+            if packet["delivery_id"] != w["delivery_id"]:
+                raise HandoffTampered(
+                    f"pending seq {w['seq']}: delivery_id does not reproduce "
+                    "from sealed bounds and packet key")
+            state = "completed" if w["completed"] else "leased"
+            # leased 区间在原节点已随 draining 自然到期：恢复为无持有者、
+            # 已到期（绝对 0 时刻）、保留全部尝试次数，接收方的下一次
+            # claim 走既有超时接管路径（边界/字节/delivery_id 不变，
+            # retries 再 +1）
+            expires = "0"
+            self.db.execute(
+                """INSERT INTO deliveries
+                   (delivery_id, tenant_id, seq, start_index, end_index,
+                    packet_json, state, lease_owner, lease_expires_at,
+                    lease_count, lease_epoch, lease_token,
+                    created_at, last_leased_at, completed_at)
+                   VALUES (?,?,?,?,?,?,?,NULL,?,?,?,NULL,?,?,?)""",
+                (w["delivery_id"], tid, w["seq"], w["start_index"],
+                 w["end_index"], dumps_canon(packet), state, expires,
+                 w["lease_count"], w["lease_count"], now, now,
+                 now if w["completed"] else None))
+
+    def _rebuild_pending_packet(self, tenant_row: sqlite3.Row,
+                                w: dict) -> dict:
+        """接收方用自己的稠密镜像在封存区间上重建同一 afp1 包。
+
+        区间内“匹配叶子”的筛选必须重放出与清单 delivery_id 一致的结果；
+        若本地叶子/筛选对不上（内容被换），delivery_id 比对随即失败。
+        """
+        rule = json.loads(tenant_row["filter_json"])
+        matched = self._match_range(rule, w["start_index"], w["end_index"],
+                                    self.batch_size * 10000)
+        matched = [lr for lr in matched
+                   if lr["leaf_index"] < w["end_index"]]
+        if not matched or matched[0]["leaf_index"] != w["start_index"] or \
+                matched[-1]["leaf_index"] + 1 != w["end_index"]:
+            raise HandoffTampered(
+                f"pending seq {w['seq']}: local matched leaves do not fill "
+                "the sealed interval")
+        return self._build_packet(tenant_row, w["seq"], w["start_index"],
+                                  matched)
+
+    def _insert_receiver_record(self, parsed: dict, manifest: dict,
+                                now: str) -> int:
+        # 部分唯一索引 ux_handoff_live_receiver 保证：两个并发事务为同一
+        # 新消费方导入时，只有一个能在此插入成功；另一个 IntegrityError
+        # 被调用方映射为 handoff_concurrent。
+        cur = self.db.execute(
+            """INSERT INTO handoff_records
+               (role, tenant_id, handoff_epoch, manifest_digest, state,
+                origin_instance, receiver_instance, manifest_json,
+                anchor_tree_size, anchor_root_hash, cursor_end,
+                created_at, updated_at)
+               VALUES ('receiver', ?, ?, ?, 'importing', ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (parsed["tenant_id"], parsed["handoff_epoch"], parsed["digest"],
+             parsed["origin_instance"], self.instance_id,
+             dumps_canon(manifest), parsed["anchor"]["tree_size"],
+             parsed["anchor"]["root_hash"], parsed["cursor_end"], now, now))
+        return int(cur.lastrowid)
+
+    def confirm_handoff(self, tenant_id: str) -> dict:
+        """接收方确认接管：阶段 importing→confirmed，产生签名 takeover receipt。
+
+        重复确认（同清单）幂等返回首张回执；旧代次/清单被换/身份串用
+        全部失败。回执绑定清单摘要、双方实例与日志锚点。
+        """
+        with self._lock:
+            tkey = self._require_transparency_key()
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                t = self._reload_tenant(tenant_id)
+                rec = self._handoff_row("receiver", tenant_id)
+                if t is None or rec is None or \
+                        rec["state"] not in ("importing", "confirmed"):
+                    raise HandoffNotImported(
+                        f"consumer {tenant_id} has no pending imported handoff "
+                        "on this node")
+                if rec["state"] == "confirmed":
+                    receipt = json.loads(rec["receipt_json"])
+                    self.db.execute("COMMIT")
+                    return self._handoff_view(
+                        rec, t, idempotent=True,
+                        manifest=json.loads(rec["manifest_json"]),
+                        receipt=receipt)
+                manifest = json.loads(rec["manifest_json"])
+                parsed = verify_manifest(manifest, tkey)
+                if manifest_digest(manifest) != rec["manifest_digest"]:
+                    raise HandoffTampered("sealed manifest digest mismatch")
+                receipt = build_receipt(
+                    tenant_id=tenant_id,
+                    handoff_epoch=parsed["handoff_epoch"],
+                    manifest_dig=rec["manifest_digest"],
+                    origin_instance=parsed["origin_instance"],
+                    receiver_instance=self.instance_id,
+                    anchor=parsed["anchor"], cursor_end=parsed["cursor_end"],
+                    pending_count=len(parsed["pending"]),
+                    confirmed_at=utcnow(), transparency_key=tkey)
+                now = utcnow()
+                self.db.execute(
+                    "UPDATE tenants SET serve_state='confirmed' WHERE tenant_id=?",
+                    (tenant_id,))
+                self.db.execute(
+                    "UPDATE handoff_records SET state='confirmed', "
+                    "receiver_instance=?, receipt_json=?, updated_at=? WHERE id=?",
+                    (self.instance_id, dumps_canon(receipt), now, rec["id"]))
+                self._event("handoff_confirmed", tenant_id=tenant_id,
+                            detail={"handoff_epoch": parsed["handoff_epoch"],
+                                    "manifest_digest": rec["manifest_digest"],
+                                    "origin_instance":
+                                        parsed["origin_instance"],
+                                    "receiver_instance": self.instance_id,
+                                    "anchor_tree_size":
+                                        parsed["anchor"]["tree_size"]})
+                self.db.execute("COMMIT")
+                rec = self._handoff_row("receiver", tenant_id)
+                return self._handoff_view(
+                    rec, self._reload_tenant(tenant_id), manifest=manifest,
+                    receipt=receipt)
+            except RelayError:
+                self.db.execute("ROLLBACK")
+                raise
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+
+    def apply_receipt(self, receipt: dict) -> dict:
+        """原节点接收管回执后永久放弃服务权（exported→relinquished）。
+
+        回执必须验签、绑定的正是本节点导出的那份清单（摘要/代次/身份
+        一致），且接收方实例不能与本节点相同。幂等：同一回执重复提交
+        返回首次结果。
+        """
+        with self._lock:
+            tkey = self._require_transparency_key()
+            parsed = verify_receipt(receipt, tkey)
+            tid = parsed["tenant_id"]
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                t = self._reload_tenant(tid)
+                rec = self._handoff_row("origin", tid)
+                if t is None or rec is None:
+                    raise HandoffIdentityMismatch(
+                        f"this node never exported consumer {tid}")
+                if rec["state"] == "relinquished":
+                    existing = json.loads(rec["receipt_json"])
+                    if existing.get("manifest_digest") == \
+                            parsed["manifest_digest"]:
+                        self.db.execute("COMMIT")
+                        return self._handoff_view(rec, t, idempotent=True,
+                                                  receipt=existing)
+                    raise HandoffConflict(
+                        "a different receipt already relinquished this consumer")
+                if rec["state"] == "revoked":
+                    raise HandoffStateConflict(
+                        "this transfer was revoked before any receipt; a "
+                        "receipt cannot relinquish a resumed consumer")
+                if rec["state"] != "exported" or not rec["manifest_json"]:
+                    raise HandoffStateConflict(
+                        f"cannot apply receipt in state {rec['state']}")
+                if parsed["origin_instance"] != self.instance_id or \
+                        parsed["receiver_instance"] == self.instance_id:
+                    # 身份串用：回执绑定的双方实例与本次导出不匹配
+                    raise HandoffReceiptInvalid(
+                        "receipt instance bindings do not match this origin "
+                        "(origin must be this node and receiver must differ)")
+                if parsed["manifest_digest"] != rec["manifest_digest"]:
+                    raise HandoffReceiptInvalid(
+                        "receipt binds a different manifest than the one this "
+                        "node exported")
+                if parsed["handoff_epoch"] != int(rec["handoff_epoch"]):
+                    raise HandoffReceiptInvalid(
+                        "receipt epoch does not match the exported epoch")
+                now = utcnow()
+                self.db.execute(
+                    "UPDATE tenants SET serve_state='relinquished' "
+                    "WHERE tenant_id=?", (tid,))
+                self.db.execute(
+                    "UPDATE handoff_records SET state='relinquished', "
+                    "receiver_instance=?, receipt_json=?, updated_at=? WHERE id=?",
+                    (parsed["receiver_instance"], dumps_canon(receipt), now,
+                     rec["id"]))
+                # 弃权后：本节点对该消费方的所有窗口都不再可服务；屏障、
+                # 越序完成记录原样保留（与接收方一致），但 claim/ack 永久拒绝
+                self._event("handoff_relinquished", tenant_id=tid,
+                            detail={"handoff_epoch": parsed["handoff_epoch"],
+                                    "manifest_digest": parsed["manifest_digest"],
+                                    "receiver_instance":
+                                        parsed["receiver_instance"]})
+                self.db.execute("COMMIT")
+                rec = self._handoff_row("origin", tid)
+                return self._handoff_view(rec, self._reload_tenant(tid),
+                                          receipt=receipt)
+            except RelayError:
+                self.db.execute("ROLLBACK")
+                raise
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+
+    def _reload_tenant(self, tenant_id: str) -> sqlite3.Row:
+        return self.db.execute(
+            "SELECT * FROM tenants WHERE tenant_id=?",
+            (tenant_id,)).fetchone()
+
+    def _handoff_view(self, rec: sqlite3.Row | None,
+                      tenant: sqlite3.Row | None, *, idempotent: bool = False,
+                      manifest: dict | None = None,
+                      receipt: dict | None = None) -> dict:
+        """转移阶段/双方实例/日志锚点/代次/未决区间的统一对外视图。"""
+        if rec is None:
+            return {"state": "none"}
+        if manifest is None and rec["manifest_json"]:
+            manifest = json.loads(rec["manifest_json"])
+        if receipt is None and rec["receipt_json"]:
+            receipt = json.loads(rec["receipt_json"])
+        anchor = None
+        pending: list = []
+        if manifest is not None:
+            anchor = manifest["anchor"]
+            anchor = {"tree_size": anchor["tree_size"],
+                      "root_hash": anchor["root_hash"]}
+            pending = manifest.get("pending", [])
+        elif rec["anchor_tree_size"] is not None:
+            anchor = {"tree_size": rec["anchor_tree_size"],
+                      "root_hash": rec["anchor_root_hash"]}
+        out = {
+            "role": rec["role"],
+            "tenant_id": rec["tenant_id"],
+            "state": rec["state"],
+            "handoff_epoch": rec["handoff_epoch"],
+            "origin_instance": rec["origin_instance"],
+            "receiver_instance": rec["receiver_instance"],
+            "manifest_digest": rec["manifest_digest"],
+            "anchor": anchor,
+            "cursor_end": rec["cursor_end"]
+                          if rec["cursor_end"] is not None
+                          else (tenant["cursor_end"] if tenant is not None else None),
+            "pending_windows": pending,
+            "pending_count": len(pending),
+            "idempotent": idempotent,
+            "updated_at": rec["updated_at"],
+            "error_reason": rec["error_reason"],
+        }
+        if manifest is not None:
+            out["manifest"] = manifest
+        if receipt is not None:
+            out["receipt"] = receipt
+        return out
+
+    def get_handoff(self, tenant_id: str) -> dict:
+        with self._lock:
+            self._require_tenant_id(tenant_id)
+            t = self._reload_tenant(tenant_id)
+            rec = self._live_handoff(tenant_id)
+            if rec is None:
+                # 已撤销的最近一轮也应可见（阶段=revoked）
+                rec = self.db.execute(
+                    "SELECT * FROM handoff_records WHERE tenant_id=? "
+                    "ORDER BY id DESC LIMIT 1", (tenant_id,)).fetchone()
+            return self._handoff_view(rec, t)
+
+    def list_handoffs(self) -> list[dict]:
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT * FROM handoff_records ORDER BY id DESC LIMIT 500"
+            ).fetchall()
+            return [self._handoff_view(r, self._reload_tenant(r["tenant_id"]))
+                    for r in rows]
+
+    # ------------------------------------------------------------------ #
     # status / observability
     # ------------------------------------------------------------------ #
 
@@ -1162,7 +2020,24 @@ class Relay:
             "backlog": max(0, trusted - row["cursor_end"]),
             "backlog_matching": matching,
             "disabled_reason": row["disable_reason"],
+            # 跨节点消费归属转移
+            "serve_state": row["serve_state"],
+            "handoff_role": row["handoff_role"],
+            "handoff_epoch": int(row["handoff_epoch"]),
+            "origin_instance": row["origin_instance"],
+            "node_instance": self.instance_id,
         }
+        live = self._live_handoff(row["tenant_id"])
+        if live is not None:
+            hv = self._handoff_view(live, row)
+            out["handoff"] = {
+                "state": hv["state"], "role": hv["role"],
+                "handoff_epoch": hv["handoff_epoch"],
+                "origin_instance": hv["origin_instance"],
+                "receiver_instance": hv["receiver_instance"],
+                "manifest_digest": hv["manifest_digest"],
+                "anchor": hv["anchor"], "pending_count": hv["pending_count"],
+                "updated_at": hv["updated_at"], "error_reason": hv["error_reason"]}
         out["current_delivery"] = current
         return out
 
@@ -1241,6 +2116,8 @@ class Relay:
             return {
                 "mirror": self.mirror_status(),
                 "tenants": tenants,
+                "handoffs": self.list_handoffs(),
+                "node_instance": self.instance_id,
                 "reject_counts": self.reject_counts(tenant_id=tenant_id),
                 "events": self.recent_events(tenant_id=tenant_id,
                                              limit=events_limit),

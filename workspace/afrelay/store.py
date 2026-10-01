@@ -9,13 +9,17 @@
 * ``mirror_leaves``  -- 稠密镜像叶子 0..trusted-1（内容寻址，含规范信封）
 * ``mirror_cps``     -- 每个已验证高度的已签名 checkpoint（逐字节存档）
 * ``tenants``        -- 隔离的审计租户：自有令牌、筛选规则、连续提交屏障、
-                        最大在途窗口数、启停
+                        最大在途窗口数、启停、跨节点转移阶段与代次
 * ``deliveries``     -- **窗口**（相邻、互不重叠的原始序号区间）：确定性包
                         字节、租约持有者/到期/epoch/不透明租约令牌、接管
                         次数、状态（leased 已租出 | completed 已完成待补洞 |
                         committed 已越过连续提交屏障）
+* ``handoff_records`` -- 跨节点消费归属转移：每个消费方至多一条存活记录，
+                        封存清单摘要/代次/日志锚点与阶段（原节点
+                        draining/exported/relinquished 与接收方
+                        importing/imported/confirmed；revoked=已撤销 draining）
 * ``relay_events``   -- 运维事件：同步推进/停止、发放/接管/完成/补洞推进/
-                        拒绝、收缩冲突、停用…
+                        拒绝、收缩冲突、停用、转移准备/撤销/导出/导入/确认…
 
 窗口边界（``start_index/end_index``）在首次发放时落库，此后**永不改变**：
 超时接管只换租约持有者与 epoch，进程重启也返回同一窗口标识与同一包字节；
@@ -81,6 +85,16 @@ CREATE TABLE IF NOT EXISTS tenants (
     cursor_end    INTEGER NOT NULL DEFAULT 0,
     max_inflight  INTEGER NOT NULL DEFAULT 8,   -- 最大在途窗口数（可动态收缩）
     filter_locked INTEGER NOT NULL DEFAULT 0,   -- 首个窗口发出即锁定
+    -- 跨节点消费归属转移：
+    --   serve_state = active | draining | exported | relinquished | importing
+    -- handoff_epoch 只增（每次 prepare 成功 +1；撤销后再次 prepare 也 +1）；
+    -- handoff_role 标记本节点是该消费方的 origin（发起方）还是
+    -- receiver（接收方）；导入的消费方用 origin_packet_key 重建同 id/同字节
+    serve_state   TEXT NOT NULL DEFAULT 'active',
+    handoff_role  TEXT,                          -- origin | receiver
+    handoff_epoch INTEGER NOT NULL DEFAULT 0,
+    origin_packet_key TEXT,                      -- 导入租户的包 HMAC 密钥(hex)
+    origin_instance TEXT,
     created_at    TEXT NOT NULL,
     disabled_at   TEXT,
     disable_reason TEXT
@@ -111,6 +125,38 @@ CREATE INDEX IF NOT EXISTS ix_deliveries_tenant_state
     ON deliveries(tenant_id, state);
 CREATE INDEX IF NOT EXISTS ix_deliveries_state ON deliveries(state);
 
+CREATE TABLE IF NOT EXISTS handoff_records (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    role             TEXT NOT NULL,             -- origin | receiver
+    tenant_id        TEXT NOT NULL,
+    handoff_epoch    INTEGER NOT NULL,
+    manifest_digest  TEXT,                       -- prepare 后导出前为空
+    state            TEXT NOT NULL,
+    -- origin: draining(已准备) | exported(已导出) | relinquished(回执后永久弃权)
+    --         | revoked(回执前撤销，允许下一轮)
+    -- receiver: importing(已恢复但尚未确认，期间不对外服务)
+    --           | confirmed(已确认接管，开始对外服务)
+    -- revoked:   origin 回执前撤销（历史行，允许下一轮 prepare 用新 epoch）
+    origin_instance  TEXT,
+    receiver_instance TEXT,
+    manifest_json    TEXT,                      -- 逐字节封存的签名清单
+    receipt_json     TEXT,                      -- confirmed 后封存的签名回执
+    anchor_tree_size INTEGER,
+    anchor_root_hash TEXT,
+    cursor_end       INTEGER,
+    error_reason     TEXT,                      -- 最近一次拒绝原因（可观察）
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    UNIQUE(role, tenant_id, handoff_epoch)
+);
+-- 同消费方在任意时刻至多一条活跃接收记录（importing/confirmed）：并发
+-- 导入在该约束上只有一个事务能插入，其余即使更新代次也失败（superseded/
+-- revoked 是历史行，不占约束）
+CREATE UNIQUE INDEX IF NOT EXISTS ux_handoff_live_receiver
+    ON handoff_records(tenant_id)
+    WHERE role='receiver' AND state IN ('importing', 'confirmed');
+CREATE INDEX IF NOT EXISTS ix_handoff_state ON handoff_records(state);
+
 CREATE TABLE IF NOT EXISTS relay_events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT NOT NULL,
@@ -139,6 +185,15 @@ _ADD_DELIVERY_COLUMNS = (
     ("completed_at", "ALTER TABLE deliveries ADD COLUMN completed_at TEXT"),
     ("committed_at", "ALTER TABLE deliveries ADD COLUMN committed_at TEXT"),
 )
+_ADD_TENANT_HANDOFF_COLUMNS = (
+    ("serve_state", "ALTER TABLE tenants ADD COLUMN serve_state "
+                    "TEXT NOT NULL DEFAULT 'active'"),
+    ("handoff_role", "ALTER TABLE tenants ADD COLUMN handoff_role TEXT"),
+    ("handoff_epoch", "ALTER TABLE tenants ADD COLUMN handoff_epoch "
+                      "INTEGER NOT NULL DEFAULT 0"),
+    ("origin_packet_key", "ALTER TABLE tenants ADD COLUMN origin_packet_key TEXT"),
+    ("origin_instance", "ALTER TABLE tenants ADD COLUMN origin_instance TEXT"),
+)
 
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -151,6 +206,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(stmt)
     existing_tenants = _column_names(conn, "tenants")
     for name, ddl in _ADD_TENANT_COLUMNS:
+        if name not in existing_tenants:
+            conn.execute(ddl)
+    for name, ddl in _ADD_TENANT_HANDOFF_COLUMNS:
         if name not in existing_tenants:
             conn.execute(ddl)
     if _column_names(conn, "deliveries"):  # 旧库可能已有 deliveries 表
@@ -191,4 +249,13 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn.execute(
         "INSERT OR IGNORE INTO meta(key, value) VALUES(?,?)",
         ("schema_version", SCHEMA_VERSION))
+    # 稳定的节点实例标识：首次打开生成后永不改变（跨节点转移用它区分
+    # 发起方/接收方，并防止把自己导出的清单导回自己）
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key='instance_id'").fetchone()
+    if row is None:
+        import secrets as _pysecrets
+        instance_id = "afrn_" + _pysecrets.token_hex(12)
+        conn.execute("INSERT INTO meta(key, value) VALUES('instance_id', ?)",
+                     (instance_id,))
     return conn

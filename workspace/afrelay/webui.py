@@ -4,7 +4,8 @@
 最大在途窗口数与在途数、每个**窗口**（相邻区间 [start,end)、持有者、
 leased/completed/committed 状态、租约 epoch/到期/重试次数）、挡住屏障的
 阻塞窗口与未覆盖空洞、拒绝原因、最近事件。支持管理员触发立即同步、
-动态收缩/放大在途上限、强制窗口超时接管、停用/创建租户。纯原生 HTML/JS，
+动态收缩/放大在途上限、强制窗口超时接管、停用/创建租户，以及跨节点消费
+归属转移（准备/撤销/导出/导入/确认接管/回执弃权）。纯原生 HTML/JS，
 单文件内嵌。
 """
 
@@ -71,6 +72,13 @@ INDEX_HTML = r"""<!doctype html>
   .win .own { color:var(--muted); }
   .hole { border:1px dashed var(--bad); color:var(--bad); border-radius:6px;
           padding:3px 8px; font-size:12px; }
+  .ho { border:1px solid var(--line); border-radius:8px; padding:8px 10px;
+        margin-top:8px; font-size:12px; }
+  .ho b { font-variant-numeric:tabular-nums; }
+  .ho .acts { margin-top:6px; display:flex; gap:6px; flex-wrap:wrap; }
+  .ho button { padding:3px 9px; font-size:12px; }
+  .phase { font-weight:600; }
+  textarea#hof { width:100%; height:90px; font-size:11px; }
   label { font-size:12px; color:var(--muted); display:block; margin:6px 0 2px; }
   #msg { color:var(--warn); font-size:12px; }
 </style>
@@ -96,6 +104,24 @@ INDEX_HTML = r"""<!doctype html>
   <section class="card span2">
     <h2>审计租户：连续提交屏障 / 在途窗口 / 持有者 / 空洞 / 重试</h2>
     <div id="tenantblocks" class="stack"></div>
+  </section>
+  <section class="card span2">
+    <h2>跨节点消费归属转移（滚动维护 / 容量调整）</h2>
+    <div class="muted" style="font-size:12px;margin-bottom:8px">
+      发起方：准备 draining（不发新窗口，短租约自然结束）→ 导出签名清单
+      → 回执产生前可撤销 / 凭接收方回执永久弃权。接收方：导入清单（须含
+      绑定的可信树头、无同名消费方）→ 确认接管产生回执。
+    </div>
+    <div id="hofnode" class="muted mono" style="font-size:12px;margin-bottom:6px"></div>
+    <div class="row">
+      <textarea id="hof" placeholder='粘贴导入清单（manifest JSON）或接管回执（receipt JSON）'></textarea>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <button onclick="handoffImport()">导入清单（接收方）</button>
+      <button class="ghost" onclick="handoffReceipt()">提交回执到原节点</button>
+    </div>
+    <pre id="hofresult" class="mono" style="font-size:11px;max-height:200px;overflow:auto"></pre>
+    <div id="handoffs" class="stack" style="margin-top:10px"></div>
   </section>
   <section class="card">
     <h2>新建租户</h2>
@@ -136,7 +162,11 @@ async function refresh(){
   try {
     const s = await api('/v1/admin/status');
     renderMirror(s.mirror); renderRejects(s.reject_counts);
-    renderTenants(s.tenants); renderEvents(s.events); msg('');
+    renderTenants(s.tenants); renderEvents(s.events);
+    renderHandoffs(s.handoffs);
+    document.getElementById('hofnode').textContent =
+      '本节点实例：' + (s.node_instance||'—');
+    msg('');
   } catch(e){ msg(e.message||String(e), true); }
 }
 function renderMirror(m){
@@ -167,7 +197,11 @@ function renderTenants(ts){
     const id = esc(t.tenant_id);
     const acts = t.active
       ? `<button class="danger" onclick="deact('${id}')">停用</button>
-         <button class="ghost" onclick="shrink('${id}')">调整在途上限</button>`
+         <button class="ghost" onclick="shrink('${id}')">调整在途上限</button>
+         <button class="ghost" onclick="hoPrepare('${id}')">准备转移</button>
+         <button class="ghost" onclick="hoExport('${id}')">导出清单</button>
+         <button class="ghost" onclick="hoRevoke('${id}')">撤销draining</button>
+         <button class="ghost" onclick="hoConfirm('${id}')">确认接管</button>`
       : '';
     const wins = (t.windows||[]).map(w=>{
       const tip = `#${w.seq} [${w.start_index},${w.end_index}) owner=${esc(w.lease_owner)} `
@@ -188,11 +222,15 @@ function renderTenants(ts){
         +esc(t.blocking_window.lease_owner)+')','bad')
       : (t.inflight===0 ? pill('无在途窗口','ok')
                         : pill('窗口全部完成待补洞','warn'));
+    const phasePill = t.serve_state && t.serve_state!=='active'
+      ? pill('转移:'+t.serve_state+' ep'+t.handoff_epoch,
+             t.serve_state==='confirmed' ? 'ok' : 'warn') : '';
     return `<div class="tblock">
       <div class="head">
         <b>${id}</b> <span class="muted">${esc(t.name)}</span>
         ${t.active?pill('active','ok'):pill('已停用','bad')}
         ${t.filter_locked?pill('规则已锁定','warn'):''}
+        ${phasePill}
         ${block}
         <span class="meta">提交屏障 <b>${t.commit_barrier}</b></span>
         <span class="meta">在途 ${t.inflight}/${t.max_inflight}</span>
@@ -200,11 +238,114 @@ function renderTenants(ts){
         <span class="meta">原始积压 ${t.backlog} · 匹配积压 ${t.backlog_matching}</span>
         <span style="flex:1"></span>${acts}
       </div>
+      ${handoffBlock(t)}
       <div class="winbar">${wins}${holes||
         '<span class="muted">暂无在途窗口（已越过屏障的窗口被回收出在途集合）</span>'}</div>
       <div class="meta mono">筛选 ${esc(JSON.stringify(t.filter))}</div>
     </div>`;
   }).join('') || '<span class="muted">尚无租户</span>';
+}
+// ---- cross-node consumer ownership handoff ---- //
+function hoPhaseClass(s){
+  return s==='confirmed' ? 'ok'
+    : (s==='relinquished'||s==='revoked') ? 'bad' : 'warn';
+}
+function handoffBlock(t){
+  const h = t.handoff;
+  if(!h) return '';
+  const a = h.anchor || {};
+  const pend = (h.pending_count!=null?h.pending_count:'—');
+  return `<div class="ho">
+    <span class="phase">${esc(h.state)}</span>
+    ep<b>${h.handoff_epoch}</b> · role=${esc(h.role)}
+    · 发起方 <span class="mono">${esc((h.origin_instance||'').slice(0,18))}</span>
+    → 接收方 <span class="mono">${esc((h.receiver_instance||'—').slice(0,18))}</span>
+    · 日志锚点 <b>${a.tree_size??'—'}</b>
+    · 已确认前缀 <b>${t.commit_barrier}</b>
+    · 未决区间 <b>${pend}</b>
+    ${h.error_reason?' · <span style="color:var(--bad)">拒绝: '+esc(h.error_reason)+'</span>':''}
+    <div class="meta mono" style="margin-top:2px">manifest ${esc((h.manifest_digest||'—').slice(0,20))}…</div>
+  </div>`;
+}
+async function hoPrepare(id){
+  if(!confirm('让 '+id+' 进入 draining？不再发放新窗口，短租约自然结束。')) return;
+  try{
+    await api('/v1/admin/tenants/'+encodeURIComponent(id)+'/handoff/prepare',
+      {method:'POST', body:JSON.stringify({reason:'ui'})});
+    msg('已进入 draining'); refresh();
+  }catch(e){ msg(e.message,true); }
+}
+async function hoRevoke(id){
+  if(!confirm('撤销 '+id+' 的 draining（接管回执产生前可撤销，原节点继续服务）？')) return;
+  try{
+    await api('/v1/admin/tenants/'+encodeURIComponent(id)+'/handoff/revoke',
+      {method:'POST', body:JSON.stringify({reason:'ui'})});
+    msg('已撤销，原节点继续服务'); refresh();
+  }catch(e){ msg(e.message,true); }
+}
+async function hoExport(id){
+  try{
+    const r = await api('/v1/admin/tenants/'+encodeURIComponent(id)+
+      '/handoff/export', {method:'POST'});
+    document.getElementById('hof').value = JSON.stringify(r.manifest, null, 2);
+    msg('已导出清单 ep'+r.handoff_epoch+'（复制到接收方导入）'); refresh();
+  }catch(e){ msg(e.message,true); }
+}
+async function hoConfirm(id){
+  if(!confirm('由本节点确认接管 '+id+'？将产生签名回执，之后原节点须凭回执弃权。')) return;
+  try{
+    const r = await api('/v1/admin/tenants/'+encodeURIComponent(id)+
+      '/handoff/confirm', {method:'POST'});
+    document.getElementById('hof').value = JSON.stringify(r.receipt, null, 2);
+    msg('已确认接管，回执已生成（复制到原节点提交）'); refresh();
+  }catch(e){ msg(e.message,true); }
+}
+async function handoffImport(){
+  let doc;
+  try{ doc = JSON.parse(document.getElementById('hof').value); }
+  catch(e){ msg('清单 JSON 非法',true); return; }
+  if(!doc.manifest_version){ msg('不是 transfer manifest',true); return; }
+  try{
+    const r = await api('/v1/admin/handoffs/import',
+      {method:'POST', body:JSON.stringify({manifest:doc})});
+    document.getElementById('hofresult').textContent =
+      '导入成功（恢复阶段 '+r.state+'）；新租户令牌（仅显示一次）：\n'
+      + (r.token||'(幂等重放，不重发令牌)');
+    msg('已恢复，确认前不对外服务'); refresh();
+  }catch(e){ msg(e.message,true); }
+}
+async function handoffReceipt(){
+  let doc;
+  try{ doc = JSON.parse(document.getElementById('hof').value); }
+  catch(e){ msg('回执 JSON 非法',true); return; }
+  if(!doc.receipt_version){ msg('不是 takeover receipt',true); return; }
+  try{
+    const r = await api('/v1/admin/handoffs/receipt',
+      {method:'POST', body:JSON.stringify({receipt:doc})});
+    document.getElementById('hofresult').textContent =
+      '原节点已永久放弃服务权：'+r.tenant_id+' ('+r.state+')';
+    msg('relinquished'); refresh();
+  }catch(e){ msg(e.message,true); }
+}
+function renderHandoffs(hs){
+  document.getElementById('handoffs').innerHTML = (hs||[]).map(h=>{
+    const a = h.anchor || {};
+    const pend = (h.pending_windows||[]).map(w=>
+      `<span class="win ${w.completed?'completed':'leased'}" title="尝试次数 ${w.lease_count}">`
+      +`[${w.start_index},${w.end_index})${w.completed?' 完成':''}×${w.lease_count}</span>`
+    ).join(' ');
+    return `<div class="ho">
+      <span class="pill ${hoPhaseClass(h.state)}">${esc(h.state)}</span>
+      <b>${esc(h.tenant_id)}</b> ep${h.handoff_epoch} · ${esc(h.role)}
+      <div class="meta">发起方 ${esc(h.origin_instance||'—')}
+        → 接收方 ${esc(h.receiver_instance||'—')}</div>
+      <div class="meta">日志锚点 高<b>${a.tree_size??'—'}</b>
+        根 <span class="mono">${esc((a.root_hash||'—').slice(0,16))}…</span>
+        · 已确认前缀 <b>${h.cursor_end??'—'}</b> · 未决 ${h.pending_count}</div>
+      <div class="winbar" style="margin-top:4px">${pend}</div>
+      <div class="meta mono">${esc((h.manifest_digest||'—').slice(0,28))}…</div>
+    </div>`;
+  }).join('') || '<span class="muted">尚无转移记录</span>';
 }
 async function shrink(id){
   const v = prompt('设置租户 '+id+' 的最大在途窗口数（收缩不会抢走有效持有者）','1');

@@ -45,6 +45,15 @@ def load_relay_keys(secrets_path: str) -> dict:
     return out
 
 
+def load_transparency_key(secrets_path: str) -> bytes:
+    keys = load_relay_keys(secrets_path)
+    key = keys.get("transparency_secret")
+    if key is None:
+        raise FileNotFoundError(
+            "secrets.json does not contain transparency_secret")
+    return key
+
+
 def verify_packet(packet: dict, keys: dict, *,
                   expected_tenant: str | None = None) -> dict:
     errors: list[str] = []

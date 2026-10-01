@@ -29,6 +29,10 @@ SQLite、从不调用任何写接口，**绝不自行补造记录**。
 | 运行中改筛选拒绝 | 租户一旦发出过窗口（含在途），筛选规则锁定，修改返回 `409 filter_locked` 且规则不变 |
 | 已停用租户拒绝 | 停用后 claim/complete 一律 `403 tenant_inactive`，屏障与历史保留，永不前移 |
 | 拒绝可审计 | 每次拒绝（回滚业务写之后）单独落一条 `reject` 事件，带稳定 `reason`，运维页/状态/CLI 可见 |
+| 跨节点归属转移 | 准备 draining（不发新任务、短租约自然结束）→ 签名 transfer manifest 封存筛选/已确认前缀/每个未决区间边界+完成标记+尝试次数+`handoff_epoch`（只增）+日志锚点；接收方证明自己的透明日志**至少包含清单绑定的可信树头**（落后 `handoff_log_behind`、分叉 `handoff_log_fork`）且**无同名消费方**才能原样恢复 |
+| 转移幂等与互斥 | 同一清单再次导入返回首次结果（只发一次新令牌）；旧代次 `handoff_stale_epoch`、内容篡改 `handoff_tampered`、并发导入 `handoff_concurrent`、身份串用 `handoff_receipt_invalid`/`handoff_self` 全部失败，绝不两个节点同时服务 |
+| 回执即弃权 | 接管回执产生**前**可撤销 draining（原节点继续）；接收方导入后**确认接管前不对外服务**（`importing`），确认（`confirmed`）产生签名回执；原节点凭有效回执永久 `relinquished`，其 claim/ack 一律 `403 tenant_relinquished` |
+| 凭据不过节点 | 转移前签发的旧租约凭据（旧 `lease_token`）在接收方接管后的窗口上一律 `stale_lease`，在双方都不能改变已确认前缀；接管后窗口 `delivery_id` 与包**逐字节不变**（清单封存该消费方的包 HMAC 密钥），尝试次数保留并在接管时 +1 |
 
 ## 数据与包格式
 
@@ -86,6 +90,106 @@ checkpoint, sig}`。
 - `delivery_id = afd_‖HMAC(packet_secret, 规范(tenant,seq,start,end,
   leaf_hashes))` 的前 32 hex；同输入永远同 id；
 - `sig` 是对去 `sig` 规范包体的 HMAC-SHA256。
+
+## 跨节点消费归属转移（滚动维护 / 容量调整）
+
+把一个消费方（审计租户）的消费状态在**两个独立中继节点**（各自独立
+`relay.sqlite`、独立 `relay_packet_secret`、各自镜像同一透明日志）之间
+整体迁移。唯一共享的信任锚仍是机构带外分发的 `transparency_secret`，
+清单 `hfm1` 与回执 `hfr1` 都用它签名。
+
+**阶段（只有这五个操作）**：
+
+```
+发起方 origin:  prepare(→draining) → export(→exported，签名清单)
+                          │                    │
+                          │ 回执产生前可撤销     │ 接收方导入后产生签名回执
+                          ▼                    ▼
+                       revoked(继续)     receipt(→relinquished，永久弃权)
+接收方 receiver: import(→importing，恢复但不服务) → confirm(→confirmed，发回执)
+```
+
+1. **准备 draining**：发起方对该消费方停止发放新窗口（claim 返回
+   `409 tenant_draining`），并把已发短租约立即置为自然到期（不抢持有者、
+   不登记完成、不动屏障）；到期前已完成窗口的提交仍被接受，越序完成事实
+   （`completed`）保留。
+2. **导出清单**：所有在途短租约结束后（否则 `409 handoff_active_leases`）
+   生成确定性签名清单，封存：消费方身份与 `handoff_epoch`（每轮
+   prepare 只增，撤销后再次准备也 +1）、**筛选条件**、**已确认前缀**
+   `cursor_end`、**每个未决区间**的边界 `[start,end)` / 完成标记
+   `completed` / 尝试次数 `lease_count`、以及绑定的**可信树头**
+   （`tree_size` + `root_hash` + 该高度已签名 checkpoint）。同清单重复
+   导出逐字节相同；`manifest_digest = sha256(规范去sig体)`。
+3. **导入**：接收方必须证明 ① 清单 HMAC 有效、结构自洽（锚 checkpoint
+   用同一 transparency key 独立验签）；② 自己的可信日志**已包含清单锚
+   定高度且该高度根一致**——未同步够 `409 handoff_log_behind`，同高度
+   根不同 `409 handoff_log_fork`；③ 不存在**同名消费方**（id 与 name
+   都不得撞）。随后原样恢复筛选、屏障、在途上限与每个未决区间（completed
+   记录不遗失；leased 区间恢复为无主、已到期、保留尝试次数）。导入后阶段
+   为 `importing`：**确认接管前接收方不对外服务**，避免与可能撤销的原
+   节点同时服务。清单封存了该消费方 afp1 包的 HMAC 密钥，使接收方重建
+   出**同一 `delivery_id` 与逐字节相同的包**（外部 worker 的幂等锚点跨
+   节点不变）。
+4. **确认接管**：`importing → confirmed`，产生签名 **takeover receipt**
+   （绑定清单摘要、双方实例与日志锚点）；之后接收方开始服务，claim 走
+   既有超时接管路径（边界/字节不变、retries 再 +1）。
+5. **撤销 / 回执**：回执产生**前** `revoke` 撤销 draining，原节点继续
+   服务（epoch 不回退）；原节点 `receipt` 校验回执（验签、origin 必须
+   是自己、receiver 必须不同、摘要/代次必须匹配本节点导出的那一份）后
+   置 `relinquished`，此后该消费方在原节点的 claim/ack 一律
+   `403 tenant_relinquished`，**永久失去服务权**。
+
+**失败一律不留半状态**（事务回滚 + 拒绝事件 `handoff_*_rejected`）：
+
+- 同清单再导入 → 返回**首次结果**（幂等，新租户令牌只随首次结果发放一次）；
+- 旧代次（epoch 不增）→ `409 handoff_stale_epoch`；已恢复的消费方再喂
+  不同清单 → `409 handoff_conflict`（不存在“替换导入”动作；正常的
+  epoch 递增链总是落到全新的接收节点）；
+- 篡改清单任意封存字段 / 错钥 / 伪造锚 checkpoint 签名 →
+  `400 handoff_tampered`；
+- 接收方日志落后 → `409 handoff_log_behind`；同高度根分叉 →
+  `409 handoff_log_fork`；
+- 并发导入同一新消费方 → 部分唯一索引上只有一个事务能建立存活记录，
+  另一个 `409 handoff_concurrent`（同清单并发则第二个幂等重放首次结果）；
+- 把自己导出的清单导回自己 → `400 handoff_self`；回执双方实例相同、
+  origin 对不上、摘要/代次对不上 → `400 handoff_receipt_invalid`；
+- 转移前的旧 `lease_token` 在接收方接管后的窗口（含已越过屏障的幂等
+  重放）一律 `409 stale_lease`；**转移前凭据在双方都不能改变已确认前缀**。
+
+**崩溃恢复**：阶段（draining/exported/importing/confirmed/revoked/
+relinquished）与封存的清单/回执全部持久化。任一方在准备、导出、导入或
+确认期间退出，重启后恢复结果只可能是「原节点继续（revoke）」或「新节点
+接管（confirm + receipt）」，屏障与越序完成记录不遗失，且不可能双方
+同时对外服务。
+
+```bash
+# 发起方：准备（draining）→ 导出签名清单（可重复导出，字节不变）
+python -m afrelay handoff HOME-A prepare aud-a --admin-token afra_… --reason "滚动维护"
+python -m afrelay handoff HOME-A export  aud-a --admin-token afra_… --out manifest.json
+# 接管回执产生之前随时可撤销（原节点继续；epoch 只增）
+python -m afrelay handoff HOME-A revoke  aud-a --admin-token afra_…
+# 接收方：导入（要求已同步到锚定高度、无同名消费方）→ 确认接管产出回执
+python -m afrelay handoff HOME-B import  aud-a --manifest manifest.json \
+    --admin-token afra_… --out import.json     # import.json 仅此次含新租户令牌
+python -m afrelay handoff HOME-B confirm aud-a --admin-token afra_… --out receipt.json
+# 发起方：凭回执永久弃权（之后该消费方 403 tenant_relinquished）
+python -m afrelay handoff HOME-A receipt --receipt receipt.json --admin-token afra_…
+# 观察：转移阶段/双方实例/日志锚点/epoch/未决区间/拒绝原因
+python -m afrelay handoff HOME-A get aud-a --admin-token afra_…
+python -m afrelay handoff HOME-B list    --admin-token afra_…
+
+# 离线（无需任一中继进程，只需 transparency_secret）
+python -m afrelay verify handoff --manifest manifest.json --secrets HOME-A/secrets.json
+python -m afrelay verify receipt --receipt receipt.json \
+    --secrets HOME-B/secrets.json --manifest manifest.json
+```
+
+HTTP（管理员）：`POST /v1/admin/tenants/<id>/handoff/{prepare,revoke,
+export,confirm}`、`POST /v1/admin/handoffs/{import,receipt}`、
+`GET /v1/admin/tenants/<id>/handoff`、`GET /v1/admin/handoffs`。运维页
+`/ui` 为每个消费方呈现阶段/双方实例/日志锚点/epoch/未决区间与准备、
+撤销、导出、导入、确认、回执操作。
+
 
 ## 快速开始
 
@@ -159,14 +263,32 @@ python -m afrelay ack ./relay-home --token dprt_… \
 `POST /v1/admin/tenants/<id>/max-inflight`（动态收缩/放大，不抢占）、
 `POST /v1/admin/tenants/<id>/deliveries/<delivery_id>/force-expire`
 （强制超时接管）、`POST /v1/admin/tenants/<id>/filter`、
-`POST /v1/admin/tenants/<id>/deactivate`。运维页 `/ui`。
+`POST /v1/admin/tenants/<id>/deactivate`；跨节点消费归属转移的
+`POST /v1/admin/tenants/<id>/handoff/{prepare,revoke,export,confirm}`、
+`POST /v1/admin/handoffs/{import,receipt}`、
+`GET /v1/admin/tenants/<id>/handoff`、`GET /v1/admin/handoffs`。
+运维页 `/ui`。
 
-错误码：`401 unauthorized`、`403 {tenant_inactive,bad_delivery}`、
+错误码：`401 unauthorized`、`403 {tenant_inactive,bad_delivery,
+tenant_relinquished}`、
 `409 {lease_conflict,inflight_cap_reached,stale_lease,ack_end_mismatch,
-filter_locked,tenant_already_exists}`、`404 {tenant_not_found,
-delivery_not_found}`、`400 {invalid_body,invalid_config,filter_invalid}`。
+filter_locked,tenant_already_exists,tenant_draining,handoff_active_leases,
+handoff_state_conflict,handoff_stale_epoch,handoff_conflict,handoff_log_behind,
+handoff_log_fork,handoff_concurrent}`、
+`400 {invalid_body,invalid_config,filter_invalid,handoff_tampered,
+handoff_self,handoff_identity_mismatch,handoff_receipt_invalid}`、
+`404 {tenant_not_found,delivery_not_found,handoff_not_imported}`。
 `inflight_cap_reached` 表示达到并行度上限的**背压**（稍后重试即可），
 与窗口有主的 `lease_conflict` 区分。
+
+跨节点归属转移（管理员）：
+`POST /v1/admin/tenants/<id>/handoff/prepare`（进入 draining）、
+`.../handoff/revoke`（回执前撤销）、`.../handoff/export`（生成签名清单）、
+`.../handoff/confirm`（接收方确认接管、产生回执）、
+`POST /v1/admin/handoffs/import`（接收方导入清单恢复）、
+`POST /v1/admin/handoffs/receipt`（原节点凭回执永久弃权）、
+`GET /v1/admin/tenants/<id>/handoff` 与 `GET /v1/admin/handoffs`
+（阶段/双方实例/日志锚点/epoch/未决区间/拒绝原因）。
 
 ## 离线投递包校验器
 
@@ -190,15 +312,19 @@ afrelay/
   canonical.py  确定性 JSON / HMAC（与 dpgw 规范编码一致）
   merkle.py     RFC 9162 Merkle 纯函数（叶哈希/折根/包含路径）
   errors.py     稳定错误码 + HTTP 状态 + 拒绝归类
-  store.py      独立 SQLite schema（镜像/租户/位点/租约/事件）
+  store.py      独立 SQLite schema（镜像/租户/位点/租约/转移记录/事件）
   upstream.py   网关只读客户端：只 GET，独立验签/折根
-  relay.py      同步推进、筛选、并行窗口租约/超时接管/完成/连续提交屏障、后台轮询、状态
-  verify.py     离线 afp1 投递包校验器
+  relay.py      同步推进、筛选、并行窗口租约/超时接管/完成/连续提交屏障、
+                后台轮询、状态、跨节点消费归属转移状态机
+  handoff.py    签名 transfer manifest(hfm1)/takeover receipt(hfr1) 纯函数
+  verify.py     离线 afp1 投递包校验器（以及清单/回执密钥加载）
   server.py     ThreadingHTTPServer JSON API（租户 + 管理）
   webui.py      零依赖运维单页（/ui）
   app.py        home 引导/密钥/打开 Relay
   cli.py        命令行
 tests/test_relay.py      47 个场景测试（真实网关 HTTP、并行窗口/补洞/收缩/接管/重启、故障上游）
+tests/test_handoff.py    24 个跨节点归属转移测试（生命周期/幂等/篡改/落后/
+                         分叉/同名/并发/身份串用/凭据不过节点/崩溃恢复/HTTP/离线）
 tests/relay_harness.py   真实已签名叶子网关 + 故障注入代理
 ```
 
@@ -224,3 +350,14 @@ epoch/retries 增长、返回新 `lease_token`；旧持有者（无新令牌）�
 一律拒绝且屏障保留；慢窗口不阻塞其他租户或同租户后续窗口；有效包离线
 验签、篡改/错钥失败；完整 HTTP 流程、管理鉴权、窗口/收缩/接管接口与
 运维页。
+
+**跨节点归属转移**：draining 后不发新窗口、短租约自然结束，导出在有未
+结束租约时 `handoff_active_leases`；清单封存筛选/前缀/每未决区间边界+
+完成标记+尝试次数/日志锚点/只增 epoch；接收方在确认前不服务、确认后
+接管窗口保持同 id 同字节且 retries+1，越序完成记录不遗失并在补洞后
+推进屏障；同清单再导入返回首次结果（只发一次令牌）；旧代次、内容篡改、
+伪造锚 checkpoint、错钥、日志落后、日志分叉、同名消费方、并发异清单
+（只一个赢家）、导回自己、回执身份串用全部失败；回执前可撤销继续、
+回执后原节点永久 `tenant_relinquished`；转移前旧 `lease_token` 在双方
+都不能改变已确认前缀；准备/导出/导入/确认/弃权任意阶段重启后只有
+「原节点继续」或「新节点接管」两种结局；HTTP、CLI 与离线 verify。
